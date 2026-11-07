@@ -1,6 +1,6 @@
-# Courseflow U校园模块（骨架）
+# Courseflow U校园模块（courseflow-uai）
 
-这是 `courseflow-unipus` 的模块骨架。**真实 CAS 账号密码登录已经打通**（含浏览器内 reader token 交换）；课程目录、视频/阅读、章节题、上传、口语、挑战卷和 Unit Test 已接入。
+这是 Courseflow 的 U校园平台模块，项目名 `courseflow-uai`。**真实 CAS 账号密码登录已经打通**（含浏览器内 reader token 交换）；课程目录、视频/阅读、章节题、上传、口语、挑战卷和 Unit Test 已接入。
 
 ## 当前实现
 
@@ -89,7 +89,7 @@ cw.browser.evaluate(fetch('/course/api/v3/ipublish/token',
 
 ```bash
 cd courseflow-framework
-npm run cli -- module add /path/to/courseflow-unipus
+npm run cli -- module add /path/to/courseflow-uai
 npm run cli -- module list
 ```
 
