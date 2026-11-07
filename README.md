@@ -132,6 +132,7 @@ npm run build   # esbuild → index.mjs
 - 口语每个 step 只处理一题（TTS + SOE + 上传约 20 秒），避免触发框架 30 秒单次调用上限；已作答的题组会自动跳过。
 - 口语依赖本机 Chromium（`CF_CHROMIUM`）和浏览器内 WebSocket；模块本身不直接开 socket。
 - TTS 使用 `fanyi.baidu.com/gettts`（已在模块网络权限中）；如果该接口失效，口语会暂停并提示语音合成失败。
+- 口语 TTS 会把生成的答案文本发送到百度语音接口，不会发送账号信息；如需完全离线，需要替换 TTS 源。
 - 讨论尚未实现。
 - 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
 
