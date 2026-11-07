@@ -123,7 +123,9 @@ npm run build   # esbuild → index.mjs
 - 挑战卷已实测：5 题 → `submitUserPaperAnswer` → `submitUserChallengeScore` → `userScore=5`，平台确认 100 分。
 - Unit Test 已实测全自动交卷：Unit test 1（26 题，单选 + 填空 + 翻译）→ 草稿 200 → 交卷 200 → 回读 status 1，**92.3 分**。
 - Unit Test 会把阅读材料拼进题干；翻译题会附加“只输出译文”的指令；框架侧同时支持选项文本 / 选项 id / A-B-C-D 和判断题同义词。
-- 其他试卷如果出现 matching 或更特殊的题型，仍可能需要人工补答或继续扩展映射。
+- Unit Test 1–8 题型完全一致：**21 × single_choice + 4 × fill_blanks_choice + 1 × translation**，共 26 题。
+- 8 个 Unit Test 中**没有 matching、writing、short_answer、discussion、upload、speaking** 等特殊题型。
+- `matching`（`text_match` / 连线）只出现在章节活动里，Unit Test 里没有；当前模块的章节题目链路已能处理 `text_match` 的选项编码。
 - **章节题目和考试都需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
 - 上传、口语、讨论尚未实现。
 - 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
