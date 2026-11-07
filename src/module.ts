@@ -46,6 +46,18 @@ import {
   submitChallengeScore,
 } from './vendor/quiz.js';
 import { buildSubmitSignature } from './vendor/submit-signature.js';
+import {
+  buildOralAnswerValue,
+  fetchClioSig,
+  speechScoreFromEvaluation,
+  waitForAnswerEvaluation,
+} from './vendor/speech.js';
+import {
+  buildSamplePdf,
+  buildUploadAnswerValue,
+  findUploadSpec,
+  uploadAnswerFile,
+} from './vendor/upload.js';
 
 const MANIFEST = JSON.parse(
   readFileSync(new URL('./courseflow.module.json', import.meta.url), 'utf8'),
@@ -568,8 +580,13 @@ function hostFetchFor(session: string) {
     delete headers.host;
     delete headers['content-length'];
     const rawBody = init.body;
-    const body =
-      rawBody === undefined || rawBody === null
+    const binaryBody =
+      rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer;
+    const body = binaryBody
+      ? Buffer.from(
+          rawBody instanceof Uint8Array ? rawBody : new Uint8Array(rawBody),
+        ).toString('base64')
+      : rawBody === undefined || rawBody === null
         ? undefined
         : typeof rawBody === 'string'
           ? rawBody
@@ -583,6 +600,7 @@ function hostFetchFor(session: string) {
       url,
       headers,
       ...(body !== undefined ? { body, encoding: 'raw' } : {}),
+      ...(binaryBody ? { binary: true } : {}),
       stage,
     });
     return new HostResponse(response);
@@ -679,6 +697,31 @@ function isTextGroup(base: string): boolean {
   return (TEXT_LEAF_BASES as readonly string[]).includes(base);
 }
 
+function isUploadGroup(base: string): boolean {
+  return base === 'multi_media_upload' || base === 'multiFileUpload_subjective';
+}
+
+/** `questionType` the reader sends for an upload group (`multi_media_upload`). */
+function uploadQuestionType(rawChapter: any, groupId: string): string {
+  const list = Array.isArray(rawChapter?.questionList) ? rawChapter.questionList : [];
+  for (const raw of list) {
+    const group = typeof raw === 'string' ? safeJson(raw) : raw;
+    if (!group || String(group.groupId ?? '') !== groupId) continue;
+    const item = Array.isArray(group.list) ? group.list[0] : undefined;
+    const type = item?.questionType ?? group.groupType;
+    if (type) return String(type).replace(/_group$/, '');
+  }
+  return 'multi_media_upload';
+}
+
+function safeJson(value: string): any {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
 const structureCache = new Map<string, { at: number; value: any }>();
 
 async function getChapterStructure(
@@ -710,7 +753,9 @@ async function readCachedAnswers(session: string, key: string): Promise<any[] | 
 }
 
 async function solveQuestions(session: string, activity: any): Promise<any[]> {
-  const payload = (activity.questions ?? []).map((question: any) => ({
+  const payload = (activity.questions ?? [])
+    .filter((question: any) => !isOralQuestion(question))
+    .map((question: any) => ({
     id: question.id,
     type: question.type,
     stem: question.stem,
@@ -744,6 +789,313 @@ async function solveQuestions(session: string, activity: any): Promise<any[]> {
   }));
 }
 
+const SPEECH_WS_URL = 'wss://speech.unipus.cn/speech/proxy/wss';
+const BAIDU_TTS_URL = 'https://fanyi.baidu.com/gettts';
+const TTS_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
+function isOralQuestion(question: any): boolean {
+  const type = String(question?.rawType ?? question?.type ?? '');
+  return type === 'oral_personal_state' || type.startsWith('oral_personal_state_');
+}
+
+/** Split a spoken answer into Baidu TTS sized chunks (<=90 chars). */
+function splitSpeechText(text: string, max = 90): string[] {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  const pieces = clean.split(/(?<=[.!?;,])\s+/);
+  const chunks: string[] = [];
+  let current = '';
+  const push = () => {
+    if (current.trim()) chunks.push(current.trim());
+    current = '';
+  };
+  for (const piece of pieces) {
+    if (piece.length > max) {
+      push();
+      for (const word of piece.split(' ')) {
+        if ((current + ' ' + word).trim().length > max && current) push();
+        current = (current + ' ' + word).trim();
+      }
+      push();
+      continue;
+    }
+    if ((current + ' ' + piece).trim().length > max) push();
+    current = (current + ' ' + piece).trim();
+  }
+  push();
+  return chunks.filter(Boolean);
+}
+
+/** Fetch Baidu TTS MP3s through the host; returns base64 parts. */
+async function synthesizeSpeech(session: string, text: string): Promise<string[]> {
+  const chunks = splitSpeechText(text);
+  if (chunks.length === 0) throw new Error('口语答案为空，无法合成语音');
+  const parts: string[] = [];
+  for (const chunk of chunks) {
+    const url =
+      `${BAIDU_TTS_URL}?lan=en&spd=5&source=web&text=${encodeURIComponent(chunk)}`;
+    const response: any = await hostCall('cw.net.fetch', {
+      session,
+      method: 'GET',
+      url,
+      headers: { accept: 'audio/mpeg,*/*', 'user-agent': TTS_USER_AGENT },
+      binary: true,
+      stage: 'read',
+    });
+    if (Number(response?.status) !== 200 || !response?.body) {
+      throw new Error(`语音合成失败：HTTP ${response?.status ?? '?'}`);
+    }
+    parts.push(String(response.body));
+  }
+  return parts;
+}
+
+function transcodeExpression(parts: string[]): string {
+  return `(async () => {
+  const parts = ${JSON.stringify(parts)};
+  const b64ToBytes = (s) => { const bin = atob(s); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i); return out; };
+  const toBase64 = (bytes) => { let binary = ''; const chunk = 0x8000; for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)); return btoa(binary); };
+  const ctx = new AudioContext();
+  const buffers = [];
+  for (const part of parts) { const bytes = b64ToBytes(part); buffers.push(await ctx.decodeAudioData(bytes.buffer.slice(0))); }
+  const gap = 0.12;
+  const total = buffers.reduce((sum, buffer) => sum + buffer.duration, 0) + gap * Math.max(0, buffers.length - 1);
+  const rate = 16000;
+  const offline = new OfflineAudioContext(1, Math.max(1, Math.ceil(total * rate)), rate);
+  let at = 0;
+  for (const buffer of buffers) { const source = offline.createBufferSource(); source.buffer = buffer; source.connect(offline.destination); source.start(at); at += buffer.duration + gap; }
+  const rendered = await offline.startRendering();
+  const samples = rendered.getChannelData(0);
+  const pcm = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i += 1) { const s = Math.max(-1, Math.min(1, samples[i])); pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff; }
+  const wav = new Uint8Array(44 + pcm.length * 2);
+  const view = new DataView(wav.buffer);
+  const write = (offset, text) => { for (let i = 0; i < text.length; i += 1) wav[offset + i] = text.charCodeAt(i); };
+  write(0, 'RIFF'); view.setUint32(4, 36 + pcm.length * 2, true); write(8, 'WAVE'); write(12, 'fmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  write(36, 'data'); view.setUint32(40, pcm.length * 2, true); wav.set(new Uint8Array(pcm.buffer), 44);
+  return { wavBase64: toBase64(wav), durationMs: Math.round(total * 1000) };
+})()`;
+}
+
+function speechExpression(
+  sig: { applicationId: string; sig: string; timestamp: number; userId: string; tokenId: string },
+  audioBase64: string,
+  transcript: string,
+  reference: string,
+): string {
+  const payload = JSON.stringify({ sig, transcript, reference });
+  return `(async () => {
+  const data = ${payload};
+  const audio = (() => { const bin = atob(${JSON.stringify(audioBase64)}); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i); return out; })();
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; try { ws.close(); } catch {} resolve(value); };
+    const timer = setTimeout(() => finish({ ok: false, error: 'SOE 评测超时' }), 60000);
+    const ws = new WebSocket(${JSON.stringify(SPEECH_WS_URL)});
+    ws.binaryType = 'arraybuffer';
+    ws.addEventListener('open', async () => {
+      try {
+        ws.send(JSON.stringify({ sdk: { version: 16777216, source: 4, protocol: 'websocket' }, app: { applicationId: data.sig.applicationId, sig: data.sig.sig, timestamp: data.sig.timestamp, userId: data.sig.userId, alg: 'sha1' } }));
+        ws.send(JSON.stringify({
+          tokenId: data.sig.tokenId,
+          audio: { audioType: 'wav', channel: 1, sampleRate: 16000, sampleBytes: 2 },
+          request: {
+            apiName: 'open.steam', transcript: data.transcript, userId: data.sig.userId, slack: 1,
+            sig: data.sig.sig, parameters: { details: { adjust: 0 } },
+            extraParam: { openQuesType: 20, openQuesRes: data.reference },
+          },
+        }));
+        for (let offset = 0; offset < audio.length; offset += 2880) {
+          if (settled) return;
+          ws.send(audio.subarray(offset, Math.min(offset + 2880, audio.length)));
+          await new Promise((done) => setTimeout(done, 8));
+        }
+        if (!settled) ws.send(JSON.stringify({ stop: true }));
+      } catch (error) { clearTimeout(timer); finish({ ok: false, error: String(error && error.message || error) }); }
+    });
+    ws.addEventListener('message', (event) => {
+      if (settled) return;
+      let raw = '';
+      if (typeof event.data === 'string') raw = event.data;
+      else { try { raw = new TextDecoder().decode(new Uint8Array(event.data)); } catch { return; } }
+      if (!raw) return;
+      let json; try { json = JSON.parse(raw); } catch { return; }
+      if (json.code !== 0 && json.code !== 200) { clearTimeout(timer); finish({ ok: false, error: json.message || ('SOE error ' + json.code) }); return; }
+      const final = json.finalResult;
+      if (!final || !final.result) return;
+      const result = final.result;
+      const extra = result.extra_details || {};
+      const multi = extra.multi_dim_score || {};
+      clearTimeout(timer);
+      finish({
+        ok: true,
+        total: Number(result.total || 0), audioTime: Number(result.audio_time || 0),
+        accuracy: Number(multi.accuracy || 0), fluency: Number(multi.fluency || 0),
+        relevance: Number(multi.relevance || 0), transcript: String(result.asr_detail || ''),
+        conclusion: String((extra.multi_dim_feedback || {}).conclusion || ''),
+      });
+    });
+    ws.addEventListener('error', () => { clearTimeout(timer); finish({ ok: false, error: 'SOE 连接失败' }); });
+    ws.addEventListener('close', (event) => { if (!settled) { clearTimeout(timer); finish({ ok: false, error: 'SOE 连接已关闭 ' + event.code }); } });
+  });
+})()`;
+}
+
+/** Ask the model for a short, natural spoken answer. */
+async function oralSpokenAnswer(session: string, prompt: string): Promise<string> {
+  const request = [
+    '你是一名大学生，正在完成英语口语任务。',
+    '只输出可以说出口的英文答案，30-45 词，自然口语，不要 Markdown，不要引号。',
+    '先给出明确观点，再给一个具体理由或例子，最后用一句简短的限定收尾。',
+    '',
+    prompt,
+  ].join('\n');
+  const response = await hostCall('cw.ai.generate', { session, prompt: request });
+  const text = String((response as any)?.text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) throw new Error('模型没有生成口语答案');
+  return text;
+}
+
+async function openOfficialPage(session: string, url: string): Promise<string> {
+  const opened: any = await hostCall('cw.browser.open', {
+    session,
+    url,
+    stage: 'read',
+  });
+  const page = String(opened?.page ?? '');
+  if (!page) throw new Error('官方浏览器没有返回页面');
+  return page;
+}
+
+/** Evaluate after the official page has left about:blank. */
+async function evaluateOnPage(session: string, page: string, expression: string): Promise<any> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const value: any = await hostCall('cw.browser.evaluate', {
+      session,
+      page,
+      stage: 'read',
+      expression,
+    });
+    if (!(value && value.loading)) return value;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error('官方页面加载超时');
+}
+
+async function runOralQuestion(
+  session: string,
+  cfg: any,
+  auth: any,
+  fetcher: any,
+  meta: any,
+  question: any,
+  page: string,
+): Promise<void> {
+  const childId = String(question.childIds?.[0] ?? question.id);
+  const prompt = String(question.stem ?? '').replace(/\s+/g, ' ').trim();
+  const spoken = await oralSpokenAnswer(session, prompt);
+  const parts = await synthesizeSpeech(session, spoken);
+  const transcoded: any = await evaluateOnPage(
+    session,
+    page,
+    transcodeExpression(parts),
+  );
+  if (!transcoded?.wavBase64) throw new Error('语音转码失败');
+  const audio = Buffer.from(String(transcoded.wavBase64), 'base64');
+  const clioOptions = {
+    token: auth.token,
+    bizQuestionId: childId,
+    baseUrl: IPUB_BASE,
+    fetcher,
+  };
+  let clio;
+  try {
+    clio = await fetchClioSig(clioOptions);
+  } catch (error) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    clio = await fetchClioSig(clioOptions);
+  }
+  const evaluation: any = await evaluateOnPage(
+    session,
+    page,
+    speechExpression(clio, String(transcoded.wavBase64), prompt, spoken),
+  );
+  if (!evaluation?.ok) throw new Error(`SOE 评测失败：${evaluation?.error ?? '未知错误'}`);
+  log(
+    'info',
+    `soe ${childId} total=${evaluation.total} acc=${evaluation.accuracy} flu=${evaluation.fluency} rel=${evaluation.relevance}`,
+  );
+  const uploaded = await uploadAnswerFile(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    {
+      data: new Uint8Array(audio),
+      fileName: `unicheat-oral-${Date.now()}.wav`,
+      contentType: 'audio/wav',
+      suffix: 'wav',
+    },
+    fetcher,
+  );
+  const callback = await waitForAnswerEvaluation({
+    token: auth.token,
+    bizAnswerId: clio.tokenId,
+    baseUrl: IPUB_BASE,
+    fetcher,
+    intervalMs: 1500,
+    maxAttempts: 20,
+  });
+  const score = callback ? speechScoreFromEvaluation(callback) : null;
+  if (!score) throw new Error('平台没有返回口语评测结果');
+  const durationMs = Number(transcoded.durationMs ?? 0);
+  const value = buildOralAnswerValue(
+    { ...score, audioTime: durationMs / 1000 },
+    uploaded.url,
+    clio.tokenId,
+  );
+  const response = await submitChapterScore(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    meta,
+    {
+      groupId: String(question.groupId ?? ''),
+      versionNumber: String(question.groupVersion ?? ''),
+      mode: 'score',
+      userAnswers: [
+        {
+          questionId: String(question.id),
+          childId,
+          questionType: 'oral_personal_state',
+          userAnswerValue: value,
+          bizAnswerId: clio.tokenId,
+        },
+      ],
+    },
+    fetcher,
+  );
+  log(
+    'info',
+    `submitScore oral ${childId} HTTP ${response.status} code ${(response.json as any)?.code ?? '?'} total=${Math.round(score.total)}`,
+  );
+  if (!response.ok) throw new Error(`口语 submitScore failed: HTTP ${response.status}`);
+}
+
+async function uploadSampleFile(fetcher: any, auth: any): Promise<any> {
+  const fileName = `unicheat-upload-${Date.now()}.pdf`;
+  return uploadAnswerFile(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    {
+      data: buildSamplePdf(),
+      fileName,
+      contentType: 'application/pdf',
+      suffix: 'pdf',
+    },
+    fetcher,
+  );
+}
+
 async function studyQuestionStep(
   params: any,
   session: string,
@@ -765,6 +1117,14 @@ async function studyQuestionStep(
   if (!activity || !Array.isArray(activity.questions) || activity.questions.length === 0) {
     throw { code: 'not_found', message: '章节结构里找不到该题目组' };
   }
+  log(
+    'debug',
+    `activity ${key} groups=${(activity.questionGroups ?? [])
+      .map((group: any) => `${group.groupType}:${group.groupId}`)
+      .join(',')} types=${activity.questions
+      .map((question: any) => `${question.rawType}/${question.type}/${question.groupId}`)
+      .join(',')}`,
+  );
 
   const chapterVersion =
     structure.chapterVersionNumber ??
@@ -782,6 +1142,47 @@ async function studyQuestionStep(
   };
 
   if (params.checkpoint?.phase !== 'submitted') {
+    const oralQuestions = (activity.questions ?? []).filter(isOralQuestion);
+    if (oralQuestions.length > 0) {
+      // One answer per step: TTS + SOE + upload + submit can take ~25s and the
+      // framework aborts a module call after 30s.
+      const done = Math.max(0, Number(params.checkpoint?.oral_index ?? 0));
+      if (done < oralQuestions.length) {
+        const question = oralQuestions[done];
+        const existing = await fetchChapterAnswerList(
+          { token: auth.token, baseUrl: IPUB_BASE },
+          String(question.groupId ?? ''),
+          String(question.groupVersion ?? ''),
+          fetcher,
+        );
+        const already = Boolean(
+          existing.data &&
+            (existing.data.score !== undefined ||
+              (existing.data.userAnswersResult?.length ?? 0) > 0),
+        );
+        if (!already) {
+          const page = await openOfficialPage(session, meta.referer);
+          try {
+            await runOralQuestion(session, cfg, auth, fetcher, meta, question, page);
+          } finally {
+            await hostCall('cw.browser.close', { session, page, stage: 'read' }).catch(() => {});
+          }
+        } else {
+          log(
+            'info',
+            `oral ${String(question.id)} already answered; skipped ` +
+              `score=${existing.data?.score ?? 'null'} answers=${existing.data?.userAnswersResult?.length ?? 0}`,
+          );
+        }
+        return {
+          status: 'in_progress',
+          progress: { oral_done: done + 1, oral_total: oralQuestions.length },
+          wait_ms: 500,
+          checkpoint: { phase: 'oral', oral_index: done + 1 },
+        };
+      }
+    }
+
     let answers = await readCachedAnswers(session, rawId);
     if (!answers) {
       answers = await solveQuestions(session, activity);
@@ -1477,15 +1878,21 @@ async function catalogUnits(params) {
         const base = String(group?.base ?? '');
         const anchor = String(group?.externalNodeId ?? '');
         if (!anchor) return;
-        if (!isVideoGroup(base) && !isTextGroup(base)) return;
-        const kind = isVideoGroup(base) ? 'video' : 'reading';
+        if (!isVideoGroup(base) && !isTextGroup(base) && !isUploadGroup(base)) return;
+        const kind = isVideoGroup(base)
+          ? 'video'
+          : isTextGroup(base)
+            ? 'reading'
+            : 'document';
         const durationMs = isVideoGroup(base)
           ? Number(durations.get(anchor)?.durationMs ?? 0)
           : 0;
         const pass = Number(progress?.[group.id]?.pass ?? 0);
         units.push({
           id: `${group.id}::${base}`,
-          name: String(group.name ?? (kind === 'video' ? '视频' : '阅读')).trim(),
+          name: String(
+            group.name ?? (kind === 'video' ? '视频' : kind === 'reading' ? '阅读' : '上传'),
+          ).trim(),
           chapter_id: chapterId,
           chapter_name: chapterName,
           lesson_id: String(owner?.id ?? ''),
@@ -1505,6 +1912,14 @@ async function catalogUnits(params) {
         const activities = structure?.structure?.activities ?? [];
         activities.forEach((activity: any, activityIndex: number) => {
           if (!activity.questions?.length) return;
+          const groupTypes = (activity.questionGroups ?? [])
+            .map((group: any) => String(group.groupType ?? ''))
+            .filter(Boolean);
+          // Upload groups have their own course-tree leaf; the synthetic
+          // `unmapped` activity would otherwise submit an empty upload answer.
+          if (groupTypes.length > 0 && groupTypes.every((type) => /multi_media_upload/.test(type))) {
+            return;
+          }
           const key = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
           units.push({
             id: `q::${chapterId}::${encodeURIComponent(key)}::${activityIndex}`,
@@ -1651,6 +2066,44 @@ async function studyStep(params) {
         'info',
         `finishNode text ${anchor} type ${base} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
       );
+    } else if (isUploadGroup(base)) {
+      const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
+      const spec = findUploadSpec(structure.raw, anchor);
+      if (!spec) throw new Error(`章节结构里找不到上传题组 ${anchor}`);
+      const questionType = uploadQuestionType(structure.raw, spec.groupId);
+      const uploaded = await uploadSampleFile(fetcher, auth);
+      const result = await submitChapterScore(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        {
+          bookId: cfg.bookId,
+          bookVersionNumber: cfg.bookVersion,
+          chapterId,
+          chapterVersionNumber: chapterVersion,
+          referer: buildChapterReferer({
+            bookId: cfg.bookId,
+            bookVersionNumber: cfg.bookVersion,
+            chapterId,
+          }),
+        },
+        {
+          groupId: spec.groupId,
+          versionNumber: spec.versionNumber,
+          mode: 'score',
+          userAnswers: [
+            {
+              childId: spec.childId,
+              questionType,
+              userAnswerValue: buildUploadAnswerValue(uploaded),
+            },
+          ],
+        },
+        fetcher,
+      );
+      log(
+        'info',
+        `submitScore upload ${spec.groupId} type=${questionType} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
+      );
+      if (!result.ok) throw new Error(`upload submitScore failed: HTTP ${result.status}`);
     } else {
       return { status: 'needs_human', reason: `未支持的类型 ${base}` };
     }

@@ -1,6 +1,6 @@
 # Courseflow U校园模块（骨架）
 
-这是 `courseflow-unipus` 的模块骨架。**真实 CAS 账号密码登录已经打通**（含浏览器内 reader token 交换）；课程目录、章节/视频/阅读/考试等业务协议仍为骨架。
+这是 `courseflow-unipus` 的模块骨架。**真实 CAS 账号密码登录已经打通**（含浏览器内 reader token 交换）；课程目录、视频/阅读、章节题、上传、口语、挑战卷和 Unit Test 已接入。
 
 ## 当前实现
 
@@ -10,8 +10,8 @@
 | `auth.begin` / `auth.submit` / `auth.poll` / `auth.complete` | ✅ 真实 CAS 账号密码登录 |
 | `auth.verify` / `auth.keepalive` | ✅ 基础实现 |
 | `catalog.courses` | ✅ 配置课程（`course_id` / `course_name`） |
-| `catalog.units` | ✅ 真实课程树：视频 / 阅读 / 题目活动，带进度回读 |
-| `study.step` | ✅ 视频/阅读 `finishNode`；客观题 `submitScore`；主观题 `judgeStart`/`judgeResult`/`submitScore` |
+| `catalog.units` | ✅ 真实课程树：视频 / 阅读 / 题目活动 / 多媒体上传，带进度回读 |
+| `study.step` | ✅ 视频/阅读 `finishNode`；客观题 `submitScore`；主观题 `judgeStart`/`judgeResult`/`submitScore`；上传 COS + `submitScore`；口语 TTS + SOE + COS + `submitScore` |
 | `catalog.papers` | ✅ 8 个挑战卷 + 8 个 Unit Test（从课程树/章节结构提取） |
 | `exam.*` | ✅ 挑战卷 create → 提交 → 分数确认；Unit Test create / 草稿 / 交卷 / 回读 |
 
@@ -127,11 +127,16 @@ npm run build   # esbuild → index.mjs
 - 8 个 Unit Test 中**没有 matching、writing、short_answer、discussion、upload、speaking** 等特殊题型。
 - `matching`（`text_match` / 连线）只出现在章节活动里，Unit Test 里没有；当前模块的章节题目链路已能处理 `text_match` 的选项编码。
 - **章节题目和考试都需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
-- 上传、口语、讨论尚未实现。
+- 上传已实测：Unit 7 多媒体上传 → COS PUT 200 → `submitScore` 200 → `unit_completed`。
+- 口语已实测：AI 生成 30–45 词答案 → 百度 TTS → 浏览器内转 16 kHz WAV → SOE WebSocket 评测（81 分）→ COS 上传 → 回读平台评测 → `submitScore` 200。
+- 口语每个 step 只处理一题（TTS + SOE + 上传约 20 秒），避免触发框架 30 秒单次调用上限；已作答的题组会自动跳过。
+- 口语依赖本机 Chromium（`CF_CHROMIUM`）和浏览器内 WebSocket；模块本身不直接开 socket。
+- TTS 使用 `fanyi.baidu.com/gettts`（已在模块网络权限中）；如果该接口失效，口语会暂停并提示语音合成失败。
+- 讨论尚未实现。
 - 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
 
 ## 下一步
 
 1. 继续覆盖其他 Unit Test 的 matching / 特殊题型。
-2. 上传、口语、讨论。
-3. 口语优先走 `cw.browser` 或返回 `needs_human`。
+2. 讨论题。
+3. 让口语 TTS 引擎可配置，并评估更稳定的语音源。

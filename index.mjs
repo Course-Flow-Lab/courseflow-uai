@@ -1,5 +1,5 @@
 // src/module.ts
-import { createCipheriv as createCipheriv2, createHmac as createHmac3 } from "node:crypto";
+import { createCipheriv as createCipheriv2, createHmac as createHmac4 } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
@@ -1565,6 +1565,294 @@ async function submitChallengeScore(options, ids, fetcher = fetch) {
   return await response.json();
 }
 
+// src/vendor/speech.ts
+var DEFAULT_BASE_URL3 = "https://ipub.unipus.cn";
+function authHeader3(token) {
+  return token.startsWith("Bearer ") ? token : `Bearer ${token}`;
+}
+async function fetchClioSig(options) {
+  const fetcher = options.fetcher ?? fetch;
+  const response = await fetcher(
+    `${options.baseUrl ?? DEFAULT_BASE_URL3}/api/reader/answer/getClioSig`,
+    {
+      method: "POST",
+      headers: {
+        authorization: authHeader3(options.token),
+        lovefrom: "learner",
+        "content-type": "application/json",
+        accept: "application/json"
+      },
+      body: JSON.stringify({
+        bizQuestionId: options.bizQuestionId,
+        questionType: options.questionType ?? "oral_personal_state",
+        soeQuestionType: options.soeQuestionType ?? 77
+      })
+    }
+  );
+  const json = await response.json();
+  if (json.code !== 200 || !json.data) {
+    throw new Error(`getClioSig failed: ${json.code} ${json.message ?? ""}`.trim());
+  }
+  const data = json.data;
+  return {
+    applicationId: String(data.applicationId),
+    sig: String(data.sig),
+    timestamp: Number(data.timestamp),
+    userId: String(data.userId),
+    tokenId: String(data.tokenId)
+  };
+}
+async function waitForAnswerEvaluation(options) {
+  const fetcher = options.fetcher ?? fetch;
+  const interval = options.intervalMs ?? 1500;
+  const attempts = options.maxAttempts ?? 20;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const url = `${options.baseUrl ?? DEFAULT_BASE_URL3}/api/reader/answer/getAnswerCallbackEvaluation?bizAnswerId=${encodeURIComponent(options.bizAnswerId)}`;
+    try {
+      const response = await fetcher(url, {
+        headers: {
+          authorization: authHeader3(options.token),
+          lovefrom: "learner",
+          accept: "application/json"
+        }
+      });
+      const json = await response.json();
+      const evaluation = json.data?.evaluation;
+      if (typeof evaluation === "string" && evaluation.length > 0) {
+        return evaluation;
+      }
+    } catch {
+    }
+    if (attempt < attempts - 1) {
+      await new Promise((done) => setTimeout(done, interval));
+    }
+  }
+  return null;
+}
+function speechScoreFromEvaluation(evaluation) {
+  let json;
+  try {
+    json = JSON.parse(evaluation);
+  } catch {
+    return null;
+  }
+  const result = json?.finalResult?.result ?? json?.result;
+  if (!result) return null;
+  const extra = result.extra_details ?? {};
+  const multi = extra.multi_dim_score ?? {};
+  return {
+    total: Number(result.total ?? 0),
+    audioTime: Number(result.audio_time ?? 0),
+    accuracy: Number(multi.accuracy ?? 0),
+    fluency: Number(multi.fluency ?? 0),
+    relevance: Number(multi.relevance ?? 0),
+    transcript: String(result.asr_detail ?? ""),
+    conclusion: String(extra?.multi_dim_feedback?.conclusion ?? ""),
+    raw: json
+  };
+}
+function buildOralAnswerValue(score, audioUrl, bizAnswerId) {
+  return JSON.stringify({
+    score: Math.round(score.total),
+    smooth: Math.round(score.fluency),
+    completed: 0,
+    correctness: Math.round(score.accuracy),
+    details: [],
+    audioUrl,
+    type: "EN_ASR_REC",
+    bizAnswerId,
+    relevance: Math.round(score.relevance),
+    duration: Math.round(score.audioTime * 1e3),
+    conclusion: score.conclusion,
+    wordDetails: []
+  });
+}
+
+// src/vendor/cos.ts
+import { createHash, createHmac as createHmac3 } from "node:crypto";
+var DEFAULT_BASE_URL4 = "https://ipub.unipus.cn";
+function authHeader4(token) {
+  return token.startsWith("Bearer ") ? token : `Bearer ${token}`;
+}
+async function fetchCosCredential(options) {
+  const fetcher = options.fetcher ?? fetch;
+  const response = await fetcher(
+    `${options.baseUrl ?? DEFAULT_BASE_URL4}/api/cos/answer/getCOSCredential`,
+    {
+      method: "GET",
+      headers: {
+        authorization: authHeader4(options.token),
+        lovefrom: "learner",
+        accept: "application/json"
+      }
+    }
+  );
+  const json = await response.json();
+  if (json.code !== 200 || !json.data) {
+    throw new Error(
+      `COS credential failed: ${json.code} ${json.message ?? ""}`.trim()
+    );
+  }
+  const data = json.data;
+  const required = ["tmpSecretId", "tmpSecretKey", "sessionToken", "domain"];
+  for (const key of required) {
+    if (!data[key]) throw new Error(`COS credential missing ${key}`);
+  }
+  return {
+    tmpSecretId: String(data.tmpSecretId),
+    tmpSecretKey: String(data.tmpSecretKey),
+    sessionToken: String(data.sessionToken),
+    domain: String(data.domain),
+    pathPrefix: String(data.pathPrefix ?? ""),
+    ...data.expiration ? { expiration: String(data.expiration) } : {}
+  };
+}
+function sha1Hex(value) {
+  return createHash("sha1").update(value, "utf8").digest("hex");
+}
+function hmacSha1Hex(key, value) {
+  return createHmac3("sha1", key).update(value, "utf8").digest("hex");
+}
+function cosAuthorization(input) {
+  const start = input.startTime ?? Math.floor(Date.now() / 1e3) - 60;
+  const end = input.endTime ?? Math.floor(Date.now() / 1e3) + 1800;
+  const keyTime = `${start};${end}`;
+  const signTime = keyTime;
+  const headerEntries = Object.entries(input.headers).map(([name, value]) => [name.toLowerCase(), value]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  const headerList = headerEntries.map(([name]) => name).join(";");
+  const headerString = headerEntries.map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`).join("&");
+  const httpString = [
+    input.method.toLowerCase(),
+    input.pathname,
+    "",
+    headerString,
+    ""
+  ].join("\n");
+  const stringToSign = ["sha1", signTime, sha1Hex(httpString), ""].join("\n");
+  const signKey = hmacSha1Hex(input.secretKey, keyTime);
+  const signature = hmacSha1Hex(signKey, stringToSign);
+  return [
+    "q-sign-algorithm=sha1",
+    `q-ak=${input.secretId}`,
+    `q-sign-time=${signTime}`,
+    `q-key-time=${keyTime}`,
+    `q-header-list=${headerList}`,
+    "q-url-param-list=",
+    `q-signature=${signature}`
+  ].join("&");
+}
+async function uploadCosObject(options) {
+  const fetcher = options.fetcher ?? fetch;
+  const domain = options.credential.domain.replace(/\/+$/, "");
+  const host = new URL(domain).host;
+  const objectPath = options.objectPath.replace(/^\/+/, "");
+  const pathname = `/${objectPath}`;
+  const url = `${domain}/${objectPath}`;
+  const authorization = cosAuthorization({
+    method: "PUT",
+    pathname,
+    headers: { host },
+    secretId: options.credential.tmpSecretId,
+    secretKey: options.credential.tmpSecretKey
+  });
+  const response = await fetcher(url, {
+    method: "PUT",
+    headers: {
+      authorization,
+      host,
+      "x-cos-security-token": options.credential.sessionToken,
+      "content-type": options.contentType ?? "audio/wav"
+    },
+    body: options.body
+  });
+  const body = await response.text();
+  return {
+    ok: response.ok,
+    status: response.status,
+    url,
+    ...response.headers.get("etag") ? { etag: response.headers.get("etag") } : {},
+    body: body.slice(0, 500)
+  };
+}
+
+// src/vendor/upload.ts
+var DEFAULT_READER_BASE_URL2 = "https://ipub.unipus.cn";
+function findUploadSpec(rawChapter, groupId) {
+  const list = Array.isArray(rawChapter.questionList) ? rawChapter.questionList : [];
+  for (const raw of list) {
+    if (!raw || typeof raw !== "object") continue;
+    const group = raw;
+    if (String(group.groupId ?? "") !== groupId) continue;
+    const item = Array.isArray(group.list) ? group.list[0] : void 0;
+    const childId = item?.children?.[0]?.childId ?? item?.childId ?? group.childId ?? null;
+    if (!group.versionNumber || !childId) return null;
+    return {
+      groupId,
+      versionNumber: String(group.versionNumber),
+      childId: String(childId)
+    };
+  }
+  return null;
+}
+async function uploadAnswerFile(options, file, fetcher = fetch) {
+  const credential = await fetchCosCredential({
+    token: options.token,
+    baseUrl: options.baseUrl ?? DEFAULT_READER_BASE_URL2,
+    fetcher
+  });
+  const objectPath = `${credential.pathPrefix.replace(/^\/+/, "")}${file.fileName}`;
+  const result = await uploadCosObject({
+    credential,
+    objectPath,
+    body: file.data,
+    contentType: file.contentType,
+    fetcher
+  });
+  if (!result.ok) {
+    throw new Error(`COS upload failed: HTTP ${result.status} ${result.body}`);
+  }
+  return {
+    url: result.url,
+    fileName: file.fileName.replace(/\.[^.]+$/, ""),
+    fileType: file.contentType,
+    fileSize: file.data.byteLength,
+    suffix: file.suffix
+  };
+}
+function buildUploadAnswerValue(file) {
+  return JSON.stringify([
+    {
+      list: [
+        {
+          fileName: file.fileName,
+          fileType: file.fileType,
+          fileSize: file.fileSize,
+          suffix: file.suffix,
+          fileUrl: file.url,
+          type: "File",
+          duration: null
+        }
+      ]
+    }
+  ]);
+}
+function buildSamplePdf(text = "Smart city design notes") {
+  const content = `BT /F1 14 Tf 30 120 Td (${text.replace(/[()\\]/g, " ")}) Tj ET`;
+  const body = [
+    "%PDF-1.4",
+    "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj",
+    "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
+    "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
+    `4 0 obj<</Length ${content.length}>>stream`,
+    content,
+    "endstream endobj",
+    "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj",
+    "trailer<</Size 6/Root 1 0 R>>",
+    "%%EOF"
+  ].join("\n");
+  return new TextEncoder().encode(body);
+}
+
 // src/module.ts
 var MANIFEST = JSON.parse(
   readFileSync(new URL("./courseflow.module.json", import.meta.url), "utf8")
@@ -1634,7 +1922,7 @@ function signAnnotatorToken2(openId, now = Date.now()) {
       aud: "edx.unipus.cn"
     })
   ).toString("base64url");
-  const signature = createHmac3("sha256", ANNOTATOR_SECRET2).update(`${header}.${payload}`).digest("base64url");
+  const signature = createHmac4("sha256", ANNOTATOR_SECRET2).update(`${header}.${payload}`).digest("base64url");
   return `${header}.${payload}.${signature}`;
 }
 function buildCasService(targetUrl) {
@@ -1952,7 +2240,10 @@ function hostFetchFor(session) {
     delete headers.host;
     delete headers["content-length"];
     const rawBody = init.body;
-    const body = rawBody === void 0 || rawBody === null ? void 0 : typeof rawBody === "string" ? rawBody : String(rawBody);
+    const binaryBody = rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer;
+    const body = binaryBody ? Buffer.from(
+      rawBody instanceof Uint8Array ? rawBody : new Uint8Array(rawBody)
+    ).toString("base64") : rawBody === void 0 || rawBody === null ? void 0 : typeof rawBody === "string" ? rawBody : String(rawBody);
     const stage = /\/api\/reader\/action\/finishNode|\/api\/reader\/answer\/submitScore|\/api\/reader\/answer\/judgeStart|\/api\/reader\/answer\/judgeResult/.test(url) ? "save_study" : "read";
     const response = await hostCall("cw.net.fetch", {
       session,
@@ -1960,17 +2251,18 @@ function hostFetchFor(session) {
       url,
       headers,
       ...body !== void 0 ? { body, encoding: "raw" } : {},
+      ...binaryBody ? { binary: true } : {},
       stage
     });
     return new HostResponse(response);
   };
 }
-function authHeader3(token) {
+function authHeader5(token) {
   return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 }
 function baseHeaders3(token) {
   return {
-    authorization: authHeader3(token),
+    authorization: authHeader5(token),
     lovefrom: "learner",
     accept: "application/json, text/plain, */*"
   };
@@ -2033,6 +2325,27 @@ function isVideoGroup(base) {
 function isTextGroup(base) {
   return TEXT_LEAF_BASES.includes(base);
 }
+function isUploadGroup(base) {
+  return base === "multi_media_upload" || base === "multiFileUpload_subjective";
+}
+function uploadQuestionType(rawChapter, groupId) {
+  const list = Array.isArray(rawChapter?.questionList) ? rawChapter.questionList : [];
+  for (const raw of list) {
+    const group = typeof raw === "string" ? safeJson2(raw) : raw;
+    if (!group || String(group.groupId ?? "") !== groupId) continue;
+    const item = Array.isArray(group.list) ? group.list[0] : void 0;
+    const type = item?.questionType ?? group.groupType;
+    if (type) return String(type).replace(/_group$/, "");
+  }
+  return "multi_media_upload";
+}
+function safeJson2(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
 var structureCache = /* @__PURE__ */ new Map();
 async function getChapterStructure(fetcher, token, cfg, chapterId) {
   const key = `${cfg.bookId}:${chapterId}`;
@@ -2056,7 +2369,7 @@ async function readCachedAnswers(session, key) {
   }
 }
 async function solveQuestions(session, activity) {
-  const payload = (activity.questions ?? []).map((question) => ({
+  const payload = (activity.questions ?? []).filter((question) => !isOralQuestion(question)).map((question) => ({
     id: question.id,
     type: question.type,
     stem: question.stem,
@@ -2089,6 +2402,281 @@ async function solveQuestions(session, activity) {
     source: "llm"
   }));
 }
+var SPEECH_WS_URL = "wss://speech.unipus.cn/speech/proxy/wss";
+var BAIDU_TTS_URL = "https://fanyi.baidu.com/gettts";
+var TTS_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+function isOralQuestion(question) {
+  const type = String(question?.rawType ?? question?.type ?? "");
+  return type === "oral_personal_state" || type.startsWith("oral_personal_state_");
+}
+function splitSpeechText(text, max = 90) {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (!clean) return [];
+  const pieces = clean.split(/(?<=[.!?;,])\s+/);
+  const chunks = [];
+  let current = "";
+  const push = () => {
+    if (current.trim()) chunks.push(current.trim());
+    current = "";
+  };
+  for (const piece of pieces) {
+    if (piece.length > max) {
+      push();
+      for (const word of piece.split(" ")) {
+        if ((current + " " + word).trim().length > max && current) push();
+        current = (current + " " + word).trim();
+      }
+      push();
+      continue;
+    }
+    if ((current + " " + piece).trim().length > max) push();
+    current = (current + " " + piece).trim();
+  }
+  push();
+  return chunks.filter(Boolean);
+}
+async function synthesizeSpeech(session, text) {
+  const chunks = splitSpeechText(text);
+  if (chunks.length === 0) throw new Error("\u53E3\u8BED\u7B54\u6848\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u5408\u6210\u8BED\u97F3");
+  const parts = [];
+  for (const chunk of chunks) {
+    const url = `${BAIDU_TTS_URL}?lan=en&spd=5&source=web&text=${encodeURIComponent(chunk)}`;
+    const response = await hostCall("cw.net.fetch", {
+      session,
+      method: "GET",
+      url,
+      headers: { accept: "audio/mpeg,*/*", "user-agent": TTS_USER_AGENT },
+      binary: true,
+      stage: "read"
+    });
+    if (Number(response?.status) !== 200 || !response?.body) {
+      throw new Error(`\u8BED\u97F3\u5408\u6210\u5931\u8D25\uFF1AHTTP ${response?.status ?? "?"}`);
+    }
+    parts.push(String(response.body));
+  }
+  return parts;
+}
+function transcodeExpression(parts) {
+  return `(async () => {
+  const parts = ${JSON.stringify(parts)};
+  const b64ToBytes = (s) => { const bin = atob(s); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i); return out; };
+  const toBase64 = (bytes) => { let binary = ''; const chunk = 0x8000; for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)); return btoa(binary); };
+  const ctx = new AudioContext();
+  const buffers = [];
+  for (const part of parts) { const bytes = b64ToBytes(part); buffers.push(await ctx.decodeAudioData(bytes.buffer.slice(0))); }
+  const gap = 0.12;
+  const total = buffers.reduce((sum, buffer) => sum + buffer.duration, 0) + gap * Math.max(0, buffers.length - 1);
+  const rate = 16000;
+  const offline = new OfflineAudioContext(1, Math.max(1, Math.ceil(total * rate)), rate);
+  let at = 0;
+  for (const buffer of buffers) { const source = offline.createBufferSource(); source.buffer = buffer; source.connect(offline.destination); source.start(at); at += buffer.duration + gap; }
+  const rendered = await offline.startRendering();
+  const samples = rendered.getChannelData(0);
+  const pcm = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i += 1) { const s = Math.max(-1, Math.min(1, samples[i])); pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff; }
+  const wav = new Uint8Array(44 + pcm.length * 2);
+  const view = new DataView(wav.buffer);
+  const write = (offset, text) => { for (let i = 0; i < text.length; i += 1) wav[offset + i] = text.charCodeAt(i); };
+  write(0, 'RIFF'); view.setUint32(4, 36 + pcm.length * 2, true); write(8, 'WAVE'); write(12, 'fmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  write(36, 'data'); view.setUint32(40, pcm.length * 2, true); wav.set(new Uint8Array(pcm.buffer), 44);
+  return { wavBase64: toBase64(wav), durationMs: Math.round(total * 1000) };
+})()`;
+}
+function speechExpression(sig, audioBase64, transcript, reference) {
+  const payload = JSON.stringify({ sig, transcript, reference });
+  return `(async () => {
+  const data = ${payload};
+  const audio = (() => { const bin = atob(${JSON.stringify(audioBase64)}); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i); return out; })();
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => { if (settled) return; settled = true; try { ws.close(); } catch {} resolve(value); };
+    const timer = setTimeout(() => finish({ ok: false, error: 'SOE \u8BC4\u6D4B\u8D85\u65F6' }), 60000);
+    const ws = new WebSocket(${JSON.stringify(SPEECH_WS_URL)});
+    ws.binaryType = 'arraybuffer';
+    ws.addEventListener('open', async () => {
+      try {
+        ws.send(JSON.stringify({ sdk: { version: 16777216, source: 4, protocol: 'websocket' }, app: { applicationId: data.sig.applicationId, sig: data.sig.sig, timestamp: data.sig.timestamp, userId: data.sig.userId, alg: 'sha1' } }));
+        ws.send(JSON.stringify({
+          tokenId: data.sig.tokenId,
+          audio: { audioType: 'wav', channel: 1, sampleRate: 16000, sampleBytes: 2 },
+          request: {
+            apiName: 'open.steam', transcript: data.transcript, userId: data.sig.userId, slack: 1,
+            sig: data.sig.sig, parameters: { details: { adjust: 0 } },
+            extraParam: { openQuesType: 20, openQuesRes: data.reference },
+          },
+        }));
+        for (let offset = 0; offset < audio.length; offset += 2880) {
+          if (settled) return;
+          ws.send(audio.subarray(offset, Math.min(offset + 2880, audio.length)));
+          await new Promise((done) => setTimeout(done, 8));
+        }
+        if (!settled) ws.send(JSON.stringify({ stop: true }));
+      } catch (error) { clearTimeout(timer); finish({ ok: false, error: String(error && error.message || error) }); }
+    });
+    ws.addEventListener('message', (event) => {
+      if (settled) return;
+      let raw = '';
+      if (typeof event.data === 'string') raw = event.data;
+      else { try { raw = new TextDecoder().decode(new Uint8Array(event.data)); } catch { return; } }
+      if (!raw) return;
+      let json; try { json = JSON.parse(raw); } catch { return; }
+      if (json.code !== 0 && json.code !== 200) { clearTimeout(timer); finish({ ok: false, error: json.message || ('SOE error ' + json.code) }); return; }
+      const final = json.finalResult;
+      if (!final || !final.result) return;
+      const result = final.result;
+      const extra = result.extra_details || {};
+      const multi = extra.multi_dim_score || {};
+      clearTimeout(timer);
+      finish({
+        ok: true,
+        total: Number(result.total || 0), audioTime: Number(result.audio_time || 0),
+        accuracy: Number(multi.accuracy || 0), fluency: Number(multi.fluency || 0),
+        relevance: Number(multi.relevance || 0), transcript: String(result.asr_detail || ''),
+        conclusion: String((extra.multi_dim_feedback || {}).conclusion || ''),
+      });
+    });
+    ws.addEventListener('error', () => { clearTimeout(timer); finish({ ok: false, error: 'SOE \u8FDE\u63A5\u5931\u8D25' }); });
+    ws.addEventListener('close', (event) => { if (!settled) { clearTimeout(timer); finish({ ok: false, error: 'SOE \u8FDE\u63A5\u5DF2\u5173\u95ED ' + event.code }); } });
+  });
+})()`;
+}
+async function oralSpokenAnswer(session, prompt) {
+  const request = [
+    "\u4F60\u662F\u4E00\u540D\u5927\u5B66\u751F\uFF0C\u6B63\u5728\u5B8C\u6210\u82F1\u8BED\u53E3\u8BED\u4EFB\u52A1\u3002",
+    "\u53EA\u8F93\u51FA\u53EF\u4EE5\u8BF4\u51FA\u53E3\u7684\u82F1\u6587\u7B54\u6848\uFF0C30-45 \u8BCD\uFF0C\u81EA\u7136\u53E3\u8BED\uFF0C\u4E0D\u8981 Markdown\uFF0C\u4E0D\u8981\u5F15\u53F7\u3002",
+    "\u5148\u7ED9\u51FA\u660E\u786E\u89C2\u70B9\uFF0C\u518D\u7ED9\u4E00\u4E2A\u5177\u4F53\u7406\u7531\u6216\u4F8B\u5B50\uFF0C\u6700\u540E\u7528\u4E00\u53E5\u7B80\u77ED\u7684\u9650\u5B9A\u6536\u5C3E\u3002",
+    "",
+    prompt
+  ].join("\n");
+  const response = await hostCall("cw.ai.generate", { session, prompt: request });
+  const text = String(response?.text ?? "").replace(/\s+/g, " ").trim();
+  if (!text) throw new Error("\u6A21\u578B\u6CA1\u6709\u751F\u6210\u53E3\u8BED\u7B54\u6848");
+  return text;
+}
+async function openOfficialPage(session, url) {
+  const opened = await hostCall("cw.browser.open", {
+    session,
+    url,
+    stage: "read"
+  });
+  const page = String(opened?.page ?? "");
+  if (!page) throw new Error("\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762");
+  return page;
+}
+async function evaluateOnPage(session, page, expression) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const value = await hostCall("cw.browser.evaluate", {
+      session,
+      page,
+      stage: "read",
+      expression
+    });
+    if (!(value && value.loading)) return value;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("\u5B98\u65B9\u9875\u9762\u52A0\u8F7D\u8D85\u65F6");
+}
+async function runOralQuestion(session, cfg, auth, fetcher, meta, question, page) {
+  const childId = String(question.childIds?.[0] ?? question.id);
+  const prompt = String(question.stem ?? "").replace(/\s+/g, " ").trim();
+  const spoken = await oralSpokenAnswer(session, prompt);
+  const parts = await synthesizeSpeech(session, spoken);
+  const transcoded = await evaluateOnPage(
+    session,
+    page,
+    transcodeExpression(parts)
+  );
+  if (!transcoded?.wavBase64) throw new Error("\u8BED\u97F3\u8F6C\u7801\u5931\u8D25");
+  const audio = Buffer.from(String(transcoded.wavBase64), "base64");
+  const clioOptions = {
+    token: auth.token,
+    bizQuestionId: childId,
+    baseUrl: IPUB_BASE,
+    fetcher
+  };
+  let clio;
+  try {
+    clio = await fetchClioSig(clioOptions);
+  } catch (error) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    clio = await fetchClioSig(clioOptions);
+  }
+  const evaluation = await evaluateOnPage(
+    session,
+    page,
+    speechExpression(clio, String(transcoded.wavBase64), prompt, spoken)
+  );
+  if (!evaluation?.ok) throw new Error(`SOE \u8BC4\u6D4B\u5931\u8D25\uFF1A${evaluation?.error ?? "\u672A\u77E5\u9519\u8BEF"}`);
+  log(
+    "info",
+    `soe ${childId} total=${evaluation.total} acc=${evaluation.accuracy} flu=${evaluation.fluency} rel=${evaluation.relevance}`
+  );
+  const uploaded = await uploadAnswerFile(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    {
+      data: new Uint8Array(audio),
+      fileName: `unicheat-oral-${Date.now()}.wav`,
+      contentType: "audio/wav",
+      suffix: "wav"
+    },
+    fetcher
+  );
+  const callback = await waitForAnswerEvaluation({
+    token: auth.token,
+    bizAnswerId: clio.tokenId,
+    baseUrl: IPUB_BASE,
+    fetcher,
+    intervalMs: 1500,
+    maxAttempts: 20
+  });
+  const score = callback ? speechScoreFromEvaluation(callback) : null;
+  if (!score) throw new Error("\u5E73\u53F0\u6CA1\u6709\u8FD4\u56DE\u53E3\u8BED\u8BC4\u6D4B\u7ED3\u679C");
+  const durationMs = Number(transcoded.durationMs ?? 0);
+  const value = buildOralAnswerValue(
+    { ...score, audioTime: durationMs / 1e3 },
+    uploaded.url,
+    clio.tokenId
+  );
+  const response = await submitChapterScore(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    meta,
+    {
+      groupId: String(question.groupId ?? ""),
+      versionNumber: String(question.groupVersion ?? ""),
+      mode: "score",
+      userAnswers: [
+        {
+          questionId: String(question.id),
+          childId,
+          questionType: "oral_personal_state",
+          userAnswerValue: value,
+          bizAnswerId: clio.tokenId
+        }
+      ]
+    },
+    fetcher
+  );
+  log(
+    "info",
+    `submitScore oral ${childId} HTTP ${response.status} code ${response.json?.code ?? "?"} total=${Math.round(score.total)}`
+  );
+  if (!response.ok) throw new Error(`\u53E3\u8BED submitScore failed: HTTP ${response.status}`);
+}
+async function uploadSampleFile(fetcher, auth) {
+  const fileName = `unicheat-upload-${Date.now()}.pdf`;
+  return uploadAnswerFile(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    {
+      data: buildSamplePdf(),
+      fileName,
+      contentType: "application/pdf",
+      suffix: "pdf"
+    },
+    fetcher
+  );
+}
 async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
   const parts = rawId.split("::");
   const chapterId = parts[1] ?? "";
@@ -2100,6 +2688,10 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
   if (!activity || !Array.isArray(activity.questions) || activity.questions.length === 0) {
     throw { code: "not_found", message: "\u7AE0\u8282\u7ED3\u6784\u91CC\u627E\u4E0D\u5230\u8BE5\u9898\u76EE\u7EC4" };
   }
+  log(
+    "debug",
+    `activity ${key} groups=${(activity.questionGroups ?? []).map((group) => `${group.groupType}:${group.groupId}`).join(",")} types=${activity.questions.map((question) => `${question.rawType}/${question.type}/${question.groupId}`).join(",")}`
+  );
   const chapterVersion = structure.chapterVersionNumber ?? await fetchChapterVersion(fetcher, auth.token, cfg, chapterId);
   const meta = {
     bookId: cfg.bookId,
@@ -2113,6 +2705,42 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
     })
   };
   if (params.checkpoint?.phase !== "submitted") {
+    const oralQuestions = (activity.questions ?? []).filter(isOralQuestion);
+    if (oralQuestions.length > 0) {
+      const done = Math.max(0, Number(params.checkpoint?.oral_index ?? 0));
+      if (done < oralQuestions.length) {
+        const question = oralQuestions[done];
+        const existing = await fetchChapterAnswerList(
+          { token: auth.token, baseUrl: IPUB_BASE },
+          String(question.groupId ?? ""),
+          String(question.groupVersion ?? ""),
+          fetcher
+        );
+        const already = Boolean(
+          existing.data && (existing.data.score !== void 0 || (existing.data.userAnswersResult?.length ?? 0) > 0)
+        );
+        if (!already) {
+          const page = await openOfficialPage(session, meta.referer);
+          try {
+            await runOralQuestion(session, cfg, auth, fetcher, meta, question, page);
+          } finally {
+            await hostCall("cw.browser.close", { session, page, stage: "read" }).catch(() => {
+            });
+          }
+        } else {
+          log(
+            "info",
+            `oral ${String(question.id)} already answered; skipped score=${existing.data?.score ?? "null"} answers=${existing.data?.userAnswersResult?.length ?? 0}`
+          );
+        }
+        return {
+          status: "in_progress",
+          progress: { oral_done: done + 1, oral_total: oralQuestions.length },
+          wait_ms: 500,
+          checkpoint: { phase: "oral", oral_index: done + 1 }
+        };
+      }
+    }
     let answers = await readCachedAnswers(session, rawId);
     if (!answers) {
       answers = await solveQuestions(session, activity);
@@ -2383,7 +3011,7 @@ async function submitUnitTest(fetcher, auth, paperData, answers, meta) {
   const payload = buildPaperSubmitPayload(paperData, answers, 1, timestamp);
   const referer = paperReferer(meta);
   const signature = buildSubmitSignature({
-    authorization: authHeader3(auth.token),
+    authorization: authHeader5(auth.token),
     openId: auth.open_id,
     referer,
     timestamp
@@ -2393,7 +3021,7 @@ async function submitUnitTest(fetcher, auth, paperData, answers, meta) {
     {
       method: "POST",
       headers: {
-        authorization: authHeader3(auth.token),
+        authorization: authHeader5(auth.token),
         lovefrom: "learner",
         "content-type": "application/json",
         accept: "application/json, text/plain, */*",
@@ -2760,13 +3388,15 @@ async function catalogUnits(params) {
         const base = String(group?.base ?? "");
         const anchor = String(group?.externalNodeId ?? "");
         if (!anchor) return;
-        if (!isVideoGroup(base) && !isTextGroup(base)) return;
-        const kind = isVideoGroup(base) ? "video" : "reading";
+        if (!isVideoGroup(base) && !isTextGroup(base) && !isUploadGroup(base)) return;
+        const kind = isVideoGroup(base) ? "video" : isTextGroup(base) ? "reading" : "document";
         const durationMs = isVideoGroup(base) ? Number(durations.get(anchor)?.durationMs ?? 0) : 0;
         const pass = Number(progress?.[group.id]?.pass ?? 0);
         units.push({
           id: `${group.id}::${base}`,
-          name: String(group.name ?? (kind === "video" ? "\u89C6\u9891" : "\u9605\u8BFB")).trim(),
+          name: String(
+            group.name ?? (kind === "video" ? "\u89C6\u9891" : kind === "reading" ? "\u9605\u8BFB" : "\u4E0A\u4F20")
+          ).trim(),
           chapter_id: chapterId,
           chapter_name: chapterName,
           lesson_id: String(owner?.id ?? ""),
@@ -2785,6 +3415,10 @@ async function catalogUnits(params) {
         const activities = structure?.structure?.activities ?? [];
         activities.forEach((activity, activityIndex) => {
           if (!activity.questions?.length) return;
+          const groupTypes = (activity.questionGroups ?? []).map((group) => String(group.groupType ?? "")).filter(Boolean);
+          if (groupTypes.length > 0 && groupTypes.every((type) => /multi_media_upload/.test(type))) {
+            return;
+          }
           const key = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
           units.push({
             id: `q::${chapterId}::${encodeURIComponent(key)}::${activityIndex}`,
@@ -2921,6 +3555,44 @@ async function studyStep(params) {
         "info",
         `finishNode text ${anchor} type ${base} HTTP ${result.status} code ${result.json?.code ?? "?"}`
       );
+    } else if (isUploadGroup(base)) {
+      const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
+      const spec = findUploadSpec(structure.raw, anchor);
+      if (!spec) throw new Error(`\u7AE0\u8282\u7ED3\u6784\u91CC\u627E\u4E0D\u5230\u4E0A\u4F20\u9898\u7EC4 ${anchor}`);
+      const questionType = uploadQuestionType(structure.raw, spec.groupId);
+      const uploaded = await uploadSampleFile(fetcher, auth);
+      const result = await submitChapterScore(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        {
+          bookId: cfg.bookId,
+          bookVersionNumber: cfg.bookVersion,
+          chapterId,
+          chapterVersionNumber: chapterVersion,
+          referer: buildChapterReferer({
+            bookId: cfg.bookId,
+            bookVersionNumber: cfg.bookVersion,
+            chapterId
+          })
+        },
+        {
+          groupId: spec.groupId,
+          versionNumber: spec.versionNumber,
+          mode: "score",
+          userAnswers: [
+            {
+              childId: spec.childId,
+              questionType,
+              userAnswerValue: buildUploadAnswerValue(uploaded)
+            }
+          ]
+        },
+        fetcher
+      );
+      log(
+        "info",
+        `submitScore upload ${spec.groupId} type=${questionType} HTTP ${result.status} code ${result.json?.code ?? "?"}`
+      );
+      if (!result.ok) throw new Error(`upload submitScore failed: HTTP ${result.status}`);
     } else {
       return { status: "needs_human", reason: `\u672A\u652F\u6301\u7684\u7C7B\u578B ${base}` };
     }

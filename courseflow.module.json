@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "unipus",
   "name": "U校园（骨架）",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "moduleApi": 1,
   "engines": { "framework": ">=0.1.1 <0.2.0" },
   "runtime": { "engine": "node", "entry": "index.mjs", "files": [] },
@@ -22,7 +22,7 @@
     }
   },
   "permissions": {
-    "network": ["unipus.cn", "*.unipus.cn", "*.myqcloud.com"],
+    "network": ["unipus.cn", "*.unipus.cn", "*.myqcloud.com", "*.baidu.com"],
     "browser": true,
     "ai": true,
     "storage": "module"
