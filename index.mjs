@@ -160,6 +160,74 @@ function lexicalText(value) {
   }
   return "";
 }
+function parsePaperData(input) {
+  const data = input ?? {};
+  const groups = data.bigQuestionGroupDTOs ?? [];
+  const questions = [];
+  const usedIds = /* @__PURE__ */ new Set();
+  for (const group of groups) {
+    const groupId = String(group.groupId ?? "");
+    const material = group.material ? lexicalText(group.material) : void 0;
+    const list = group.list ?? [];
+    for (const raw of list) {
+      const rawType = String(raw.questionType ?? group.groupType ?? "");
+      const kind = classifyQuestion(rawType);
+      const type = kind.type;
+      const children = raw.children ?? [];
+      const child = children[0] ?? raw;
+      const stem = String(
+        raw.quesTextString ?? lexicalText(raw.quesText) ?? ""
+      ).trim();
+      if (!stem) continue;
+      const options = ((child.options ?? []).length > 0 ? child.options : raw.options ?? []).map((option, index) => ({
+        index,
+        text: rawType === "fill_blanks_choice" && option.label ? String(option.label).trim() : lexicalText(option.optionValue) || String(option.label ?? "").trim(),
+        ...option.optionId ? { value: String(option.optionId) } : {},
+        ...option.label ? { label: String(option.label) } : {},
+        ...option.optionId ? { optionId: String(option.optionId) } : {}
+      }));
+      const childIds = children.map((item) => item.childId ? String(item.childId) : "").filter(Boolean);
+      const baseId = String(raw.id ?? child.childId ?? `q${questions.length + 1}`);
+      const id = usedIds.has(baseId) ? `${groupId}:${baseId}` : baseId;
+      usedIds.add(id);
+      const question = {
+        id,
+        index: questions.length,
+        type,
+        stem,
+        options,
+        blankCount: kind.answerMode === "blanks" || kind.answerMode === "text" ? Math.max(children.length, 1) : 0,
+        answerMode: kind.answerMode,
+        groupId,
+        rawType,
+        ...children.length > 0 ? {
+          blanks: children.map((item, position) => ({
+            ...item.childId ? { id: String(item.childId) } : {},
+            index: position + 1
+          }))
+        } : {},
+        ...child.childId ? { childId: String(child.childId) } : {},
+        ...childIds.length > 0 ? { childIds } : {},
+        ...options.some((option) => option.value) ? {
+          optionIds: options.map((option) => String(option.value ?? ""))
+        } : {}
+      };
+      if (material) question.passage = material;
+      if (typeof raw.score === "number") question.score = raw.score;
+      questions.push(question);
+    }
+  }
+  return {
+    instanceId: data.instanceId ? String(data.instanceId) : void 0,
+    paperId: String(data.paperId ?? ""),
+    paperName: String(data.paperName ?? ""),
+    paperType: Number(data.paperType ?? 0),
+    versionNumber: String(data.versionNumber ?? ""),
+    questionCount: Number(data.questionCount ?? questions.length),
+    totalScore: Number(data.totalScore ?? 0),
+    questions
+  };
+}
 
 // src/vendor/chapter-structure.ts
 function isObject(value) {
@@ -1350,6 +1418,153 @@ async function markNodeRead(options, node, fetcher = fetch) {
   );
 }
 
+// src/vendor/paper-api.ts
+function buildPaperAnswerMap(paper, answers) {
+  const byId = new Map(answers.map((answer) => [answer.questionId, answer]));
+  const map = {};
+  for (const question of paper.questions) {
+    const answer = byId.get(question.id);
+    const texts = answer?.texts ?? [];
+    const records = [];
+    if (question.type === "single" || question.type === "multiple" || question.type === "judge") {
+      const optionIds = texts.map(
+        (text) => question.options.find((option) => option.text === text)?.value ?? ""
+      ).filter(Boolean);
+      records.push({
+        childId: question.childId ?? "",
+        questionType: question.rawType,
+        userAnswerValue: JSON.stringify(optionIds)
+      });
+    } else {
+      const childIds = question.childIds ?? [];
+      if (childIds.length > 1) {
+        childIds.forEach((childId, index) => {
+          records.push({
+            childId,
+            questionType: question.rawType,
+            userAnswerValue: texts[index] ?? ""
+          });
+        });
+      } else {
+        records.push({
+          childId: question.childId ?? "",
+          questionType: question.rawType,
+          userAnswerValue: texts.join("\n")
+        });
+      }
+    }
+    map[question.groupId] = [...map[question.groupId] ?? [], ...records];
+  }
+  return map;
+}
+function buildPaperSavePayload(paper, answers, testMode = 1) {
+  if (!paper.instanceId) {
+    throw new Error("paper.instanceId is required for saving answers");
+  }
+  return {
+    instanceId: paper.instanceId,
+    paperType: paper.paperType,
+    testMode,
+    baseInstanceId: paper.instanceId,
+    userAnswerParamsMap: buildPaperAnswerMap(paper, answers)
+  };
+}
+function buildPaperSubmitPayload(paper, answers, testMode = 1, timestamp = Date.now()) {
+  if (!paper.instanceId) {
+    throw new Error("paper.instanceId is required for submitting");
+  }
+  return {
+    instanceId: paper.instanceId,
+    paperType: paper.paperType,
+    testMode,
+    baseInstanceId: paper.instanceId,
+    userAnswerParamsMap: buildPaperAnswerMap(paper, answers),
+    async: true,
+    a: timestamp,
+    b: timestamp
+  };
+}
+
+// src/vendor/quiz.ts
+var DEFAULT_BASE_URL2 = "https://ipub.unipus.cn";
+function collectQuizLinks(units) {
+  const links = [];
+  const walk = (unit, node) => {
+    if (node.base === "quiz-paper-link" && node.externalNodeId) {
+      links.push({
+        unit: unit.id,
+        unitName: unit.name ?? "",
+        groupId: node.id,
+        paperId: node.externalNodeId,
+        title: (node.name ?? "Quiz").trim()
+      });
+    }
+    for (const child of node.children ?? []) walk(unit, child);
+  };
+  for (const unit of units) for (const child of unit.children ?? []) walk(unit, child);
+  return links;
+}
+function authHeader2(token) {
+  return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+}
+function baseHeaders2(token) {
+  return {
+    authorization: authHeader2(token),
+    lovefrom: "learner",
+    accept: "application/json, text/plain, */*",
+    "content-type": "application/json"
+  };
+}
+async function createChallengeInstance(options, ids, fetcher = fetch) {
+  const response = await fetcher(
+    `${options.baseUrl ?? DEFAULT_BASE_URL2}/api/reader/paper/instance/createPaperInstanceByPublishedBook`,
+    { method: "POST", headers: baseHeaders2(options.token), body: JSON.stringify(ids) }
+  );
+  const json = await response.json();
+  if (json.code !== 200 || !json.data) {
+    throw new Error(`createChallengeInstance: ${json.message ?? `code ${json.code}`}`);
+  }
+  return json.data;
+}
+async function submitChallengeAnswers(options, payload, fetcher = fetch) {
+  const timestamp = payload.a;
+  const signature = buildSubmitSignature({
+    authorization: authHeader2(options.token),
+    openId: readOpenId(options.token),
+    referer: options.referer,
+    timestamp
+  });
+  const response = await fetcher(
+    `${options.baseUrl ?? DEFAULT_BASE_URL2}/api/reader/paper/answer/submitUserPaperAnswer`,
+    {
+      method: "POST",
+      headers: {
+        ...baseHeaders2(options.token),
+        origin: "https://ipub.unipus.cn",
+        referer: options.referer,
+        "x-referer": options.referer,
+        v: signature
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+  return await response.json();
+}
+async function submitChallengeScore(options, ids, fetcher = fetch) {
+  const response = await fetcher(
+    `${options.baseUrl ?? DEFAULT_BASE_URL2}/api/reader/paper/answer/submitUserChallengeScore`,
+    {
+      method: "POST",
+      headers: {
+        ...baseHeaders2(options.token),
+        ...options.referer ? { origin: "https://ipub.unipus.cn", referer: options.referer, "x-referer": options.referer } : {}
+      },
+      body: JSON.stringify(ids)
+    }
+  );
+  return await response.json();
+}
+
 // src/module.ts
 var MANIFEST = JSON.parse(
   readFileSync(new URL("./courseflow.module.json", import.meta.url), "utf8")
@@ -1750,12 +1965,12 @@ function hostFetchFor(session) {
     return new HostResponse(response);
   };
 }
-function authHeader2(token) {
+function authHeader3(token) {
   return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 }
-function baseHeaders2(token) {
+function baseHeaders3(token) {
   return {
-    authorization: authHeader2(token),
+    authorization: authHeader3(token),
     lovefrom: "learner",
     accept: "application/json, text/plain, */*"
   };
@@ -1795,13 +2010,13 @@ function findGroup(units, groupId) {
 }
 async function fetchChapterList(fetcher, token, cfg) {
   const url = `${IPUB_BASE}/api/reader/chapter/getChapterList?bookId=${encodeURIComponent(cfg.bookId)}&bookVersionNumber=${encodeURIComponent(cfg.bookVersion)}`;
-  const response = await fetcher(url, { headers: baseHeaders2(token) });
+  const response = await fetcher(url, { headers: baseHeaders3(token) });
   const json = await response.json();
   return Array.isArray(json?.data?.chapterList) ? json.data.chapterList : [];
 }
 async function fetchChapterVersion(fetcher, token, cfg, chapterId) {
   const url = `${IPUB_BASE}/api/reader/chapter/getChapterInfo?bookId=${encodeURIComponent(cfg.bookId)}&bookVersionNumber=${encodeURIComponent(cfg.bookVersion)}&chapterId=${encodeURIComponent(chapterId)}`;
-  const response = await fetcher(url, { headers: baseHeaders2(token) });
+  const response = await fetcher(url, { headers: baseHeaders3(token) });
   const json = await response.json();
   const data = json?.data ?? {};
   let version = data.versionNumber ? String(data.versionNumber) : void 0;
@@ -1962,6 +2177,430 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
     };
   }
   return { status: "in_progress", wait_ms: 2e3, checkpoint: { phase: "submitted" } };
+}
+var paperCache = /* @__PURE__ */ new Map();
+function paperReferer(meta) {
+  return buildChapterReferer({
+    bookId: meta.bookId,
+    bookVersionNumber: meta.bookVersion,
+    chapterId: meta.chapterId
+  });
+}
+async function refreshPapers(session, cfg, auth, fetcher) {
+  const tree = await fetchCourseTree(
+    { token: auth.token, cookie: "", courseId: cfg.id, baseUrl: CONTENT_BASE },
+    fetcher
+  );
+  const treeLinks = collectQuizLinks(tree);
+  const chapters = await fetchChapterList(fetcher, auth.token, cfg);
+  const collected = [];
+  for (const link of treeLinks) {
+    collected.push({ paperId: link.paperId, paperType: 0, chapterId: "", chapterName: link.unitName });
+  }
+  for (const chapter of chapters) {
+    let structure;
+    try {
+      structure = await getChapterStructure(fetcher, auth.token, cfg, String(chapter.id));
+    } catch (error) {
+      log("warn", `paper structure ${chapter.id} failed: ${errorText(error)}`);
+      continue;
+    }
+    const links = [];
+    for (const raw of structure?.raw?.quizPaperLinks ?? []) {
+      try {
+        const link = typeof raw === "string" ? JSON.parse(raw) : raw;
+        if (link?.paperId) links.push(link);
+      } catch {
+      }
+    }
+    for (const activity of structure?.structure?.activities ?? []) {
+      for (const link of activity.paperLinks ?? []) if (link?.paperId) links.push(link);
+    }
+    for (const link of links) {
+      collected.push({
+        paperId: String(link.paperId),
+        paperType: Number(link.paperType ?? 0),
+        chapterId: String(chapter.id),
+        chapterName: String(chapter.name ?? "")
+      });
+    }
+  }
+  const byId = /* @__PURE__ */ new Map();
+  for (const entry of collected) {
+    const existing = byId.get(entry.paperId);
+    if (!existing) {
+      byId.set(entry.paperId, { ...entry });
+      continue;
+    }
+    if (!existing.chapterId && entry.chapterId) {
+      existing.chapterId = entry.chapterId;
+      existing.chapterName = entry.chapterName;
+    }
+    if (!existing.paperType && entry.paperType) existing.paperType = entry.paperType;
+  }
+  for (const entry of byId.values()) {
+    const paperId = entry.paperId;
+    let paperType = entry.paperType;
+    let paperName = paperId;
+    let versionNumber = "";
+    try {
+      const response = await fetcher(
+        `${IPUB_BASE}/api/reader/paper/getPaperVersionByPublishedBook`,
+        {
+          method: "POST",
+          headers: { ...baseHeaders3(auth.token), "content-type": "application/json" },
+          body: JSON.stringify({
+            bookId: cfg.bookId,
+            bookVersionNumber: cfg.bookVersion,
+            paperId
+          })
+        }
+      );
+      const json = await response.json();
+      if (json?.data) {
+        paperName = String(json.data.paperName ?? paperName);
+        versionNumber = String(json.data.versionNumber ?? "");
+        if (!paperType && json.data.paperType) paperType = Number(json.data.paperType);
+      }
+    } catch (error) {
+      log("warn", `paper version ${paperId} failed: ${errorText(error)}`);
+    }
+    if (paperType !== 2 && paperType !== 3) paperType = 2;
+    paperCache.set(paperId, {
+      paperId,
+      paperType,
+      paperName,
+      versionNumber,
+      chapterId: entry.chapterId,
+      chapterName: entry.chapterName,
+      bookId: cfg.bookId,
+      bookVersion: cfg.bookVersion
+    });
+  }
+}
+async function catalogPapers(params) {
+  if (SOURCE !== "live") return { papers: [] };
+  const session = String(params.session ?? "");
+  const cfg = courseConfig();
+  if (!cfg) throw { code: "invalid_params", message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E course_id / book_id / book_version" };
+  if (params.course?.id && params.course.id !== cfg.id) return { papers: [] };
+  const auth = await readAuth(session);
+  const fetcher = hostFetchFor(session);
+  await refreshPapers(session, cfg, auth, fetcher);
+  return {
+    papers: [...paperCache.values()].map((meta) => ({
+      id: meta.paperId,
+      name: meta.paperName,
+      category: meta.paperType === 3 ? "unit_test" : "challenge",
+      available: true,
+      done: false,
+      can_redo: true,
+      can_review: true,
+      score: null,
+      attempts_left: null,
+      ends_at: null
+    }))
+  };
+}
+function toExamAttempt(paperData) {
+  return {
+    id: paperData.instanceId,
+    paper_id: paperData.paperId,
+    name: paperData.paperName,
+    expires_at: null,
+    questions: (paperData.questions ?? []).map((question) => ({
+      id: question.id,
+      kind: question.type === "single" ? "single" : question.type === "multiple" ? "multiple" : question.type === "judge" ? "judge" : question.type === "fill" ? "blank" : "essay",
+      text: question.stem,
+      options: (question.options ?? []).map((option) => ({
+        id: String(option.optionId ?? option.value ?? option.index),
+        text: option.text
+      })),
+      answer: [],
+      blanks: question.blankCount ?? 0
+    }))
+  };
+}
+async function createUnitTestInstance(fetcher, auth, cfg, meta) {
+  const response = await fetcher(
+    `${IPUB_BASE}/api/reader/paper/instance/createPaperInstanceByPublishedBook`,
+    {
+      method: "POST",
+      headers: { ...baseHeaders3(auth.token), "content-type": "application/json" },
+      body: JSON.stringify({
+        bookId: cfg.bookId,
+        bookVersionNumber: cfg.bookVersion,
+        paperId: meta.paperId,
+        versionNumber: meta.versionNumber,
+        testMode: 1
+      })
+    }
+  );
+  const json = await response.json();
+  if (json.code !== 200 || !json.data) {
+    throw new Error(`createPaperInstance failed: ${json.message ?? `code ${json.code}`}`);
+  }
+  return parsePaperData(json.data);
+}
+async function saveUnitTestAnswers(fetcher, auth, paperData, answers) {
+  const payload = buildPaperSavePayload(paperData, answers, 1);
+  const response = await fetcher(
+    `${IPUB_BASE}/api/reader/paper/answer/saveUserPaperAnswer`,
+    {
+      method: "POST",
+      headers: { ...baseHeaders3(auth.token), "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    }
+  );
+  const json = await response.json();
+  if (json.code !== 200) throw new Error(`saveUserPaperAnswer failed: ${json.message ?? `code ${json.code}`}`);
+  log("info", `exam unit_test draft saved code=${json.code}`);
+}
+async function submitUnitTest(fetcher, auth, paperData, answers, meta) {
+  const timestamp = Date.now();
+  const payload = buildPaperSubmitPayload(paperData, answers, 1, timestamp);
+  const referer = paperReferer(meta);
+  const signature = buildSubmitSignature({
+    authorization: authHeader3(auth.token),
+    openId: auth.open_id,
+    referer,
+    timestamp
+  });
+  const response = await fetcher(
+    `${IPUB_BASE}/api/reader/paper/answer/submitUserPaperAnswer`,
+    {
+      method: "POST",
+      headers: {
+        authorization: authHeader3(auth.token),
+        lovefrom: "learner",
+        "content-type": "application/json",
+        accept: "application/json, text/plain, */*",
+        origin: "https://ipub.unipus.cn",
+        referer,
+        "x-referer": referer,
+        v: signature
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+  const json = await response.json();
+  if (json.code !== 200) throw new Error(`submitUserPaperAnswer failed: ${json.message ?? `code ${json.code}`}`);
+  log("info", `exam unit_test submit code=${json.code}`);
+}
+async function readPaperScore(fetcher, auth, paperData) {
+  const response = await fetcher(
+    `${IPUB_BASE}/api/reader/paper/answer/getUserPaperScore`,
+    {
+      method: "POST",
+      headers: { ...baseHeaders3(auth.token), "content-type": "application/json" },
+      body: JSON.stringify({
+        instanceId: paperData.instanceId,
+        paperId: paperData.paperId,
+        versionNumber: paperData.versionNumber,
+        paperType: paperData.paperType,
+        testMode: 1
+      })
+    }
+  );
+  const json = await response.json();
+  return json?.data ?? {};
+}
+async function examOpen(params) {
+  const session = String(params.session ?? "");
+  const cfg = courseConfig();
+  if (!cfg) throw { code: "invalid_params", message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E course_id / book_id / book_version" };
+  const auth = await readAuth(session);
+  const fetcher = hostFetchFor(session);
+  const paperId = String(params.paper_id ?? "");
+  let meta = paperCache.get(paperId);
+  if (!meta) {
+    await refreshPapers(session, cfg, auth, fetcher);
+    meta = paperCache.get(paperId);
+  }
+  if (!meta) throw { code: "not_found", message: "\u8BD5\u5377\u4E0D\u5B58\u5728" };
+  let paperData;
+  if (meta.paperType === 2) {
+    const instance = await createChallengeInstance(
+      { token: auth.token, baseUrl: IPUB_BASE },
+      { bookId: cfg.bookId, bookVersionNumber: cfg.bookVersion, paperId: meta.paperId },
+      fetcher
+    );
+    paperData = parsePaperData(instance);
+  } else {
+    paperData = await createUnitTestInstance(fetcher, auth, cfg, meta);
+  }
+  if (!paperData.instanceId) throw new Error("\u8BD5\u5377\u5B9E\u4F8B\u7F3A\u5C11 instanceId");
+  await hostCall("cw.state", {
+    session,
+    namespace: "exam",
+    key: `paper/${paperData.instanceId}`,
+    value: { meta, paperData, answers: {}, phase: "opened" }
+  });
+  await hostCall("cw.state", {
+    session,
+    namespace: "exam",
+    key: `latest/${paperData.paperId}`,
+    value: paperData.instanceId
+  });
+  return { ready: true, attempt: toExamAttempt(paperData) };
+}
+async function examWrite(params) {
+  const session = String(params.session ?? "");
+  const auth = await readAuth(session);
+  const fetcher = hostFetchFor(session);
+  const attemptId = String(params.attempt_id ?? "");
+  const stored = await hostCall("cw.state", {
+    session,
+    namespace: "exam",
+    key: `paper/${attemptId}`
+  });
+  const state = stored?.value;
+  if (!state?.paperData || !state?.meta) throw { code: "not_found", message: "\u8BD5\u5377\u5B9E\u4F8B\u4E0D\u5B58\u5728" };
+  const incoming = params.answers && typeof params.answers === "object" ? params.answers : {};
+  const merged = { ...state.answers ?? {}, ...incoming };
+  const byQuestion = new Map(
+    (state.paperData.questions ?? []).map((question) => [question.id, question])
+  );
+  const answerList = Object.entries(merged).map(([questionId, texts]) => {
+    const question = byQuestion.get(questionId);
+    const values = Array.isArray(texts) ? texts.map(String) : [];
+    const converted = values.map((value) => {
+      const options = question?.options ?? [];
+      const match = options.find(
+        (option) => String(option.optionId ?? "") === value || String(option.value ?? "") === value || String(option.label ?? "") === value
+      );
+      return match?.text ?? value;
+    });
+    return {
+      questionId,
+      texts: converted,
+      confidence: 1,
+      source: "manual"
+    };
+  });
+  const phase = params.phase === "submit" ? "submit" : "draft";
+  if (state.meta.paperType === 2) {
+    if (phase !== "submit") {
+      await hostCall("cw.state", {
+        session,
+        namespace: "exam",
+        key: `paper/${attemptId}`,
+        value: { ...state, answers: merged, phase: "draft" }
+      });
+      return { done: true, cursor: null, draft_supported: false };
+    }
+    if (state.phase === "submitted") {
+      return { done: true, cursor: null, draft_supported: false };
+    }
+    const timestamp = Date.now();
+    const answerMap = buildPaperAnswerMap(state.paperData, answerList);
+    log(
+      "info",
+      `exam challenge paper=${state.paperData.paperId} answers=${answerList.length} groups=${Object.keys(answerMap).length}`
+    );
+    const payload = {
+      instanceId: state.paperData.instanceId,
+      paperType: state.paperData.paperType,
+      userAnswerParamsMap: answerMap,
+      a: timestamp,
+      b: timestamp
+    };
+    const answer = await submitChallengeAnswers(
+      { token: auth.token, baseUrl: IPUB_BASE, referer: paperReferer(state.meta) },
+      payload,
+      fetcher
+    );
+    log(
+      "info",
+      `exam challenge answer code=${answer.code ?? "?"} message=${String(answer.message ?? "").slice(0, 120)}`
+    );
+    if (answer.code !== 0 && answer.code !== 200) {
+      throw new Error(`submitUserPaperAnswer failed: ${answer.message ?? `code ${answer.code}`}`);
+    }
+    const score = await submitChallengeScore(
+      { token: auth.token, baseUrl: IPUB_BASE, referer: paperReferer(state.meta) },
+      { paperId: state.paperData.paperId, versionNumber: state.paperData.versionNumber },
+      fetcher
+    );
+    log(
+      "info",
+      `exam challenge score code=${score.code ?? "?"} status=${score.data?.status ?? "?"} userScore=${score.data?.userScore ?? "?"}`
+    );
+    if (score.code !== 0 && score.code !== 200) {
+      throw new Error(`submitUserChallengeScore failed: ${score.message ?? `code ${score.code}`}`);
+    }
+    await hostCall("cw.state", {
+      session,
+      namespace: "exam",
+      key: `paper/${attemptId}`,
+      value: { ...state, answers: merged, phase: "submitted" }
+    });
+    return { done: true, cursor: null, draft_supported: false };
+  }
+  if (phase === "submit") {
+    await submitUnitTest(fetcher, auth, state.paperData, answerList, state.meta);
+    await hostCall("cw.state", {
+      session,
+      namespace: "exam",
+      key: `paper/${attemptId}`,
+      value: { ...state, answers: merged, phase: "submitted" }
+    });
+    return { done: true, cursor: null, draft_supported: true };
+  }
+  await saveUnitTestAnswers(fetcher, auth, state.paperData, answerList);
+  await hostCall("cw.state", {
+    session,
+    namespace: "exam",
+    key: `paper/${attemptId}`,
+    value: { ...state, answers: merged, phase: "draft" }
+  });
+  return { done: true, cursor: null, draft_supported: true };
+}
+async function examReadback(params) {
+  const session = String(params.session ?? "");
+  const auth = await readAuth(session);
+  const fetcher = hostFetchFor(session);
+  const attemptId = String(params.attempt_id ?? "");
+  const stored = await hostCall("cw.state", {
+    session,
+    namespace: "exam",
+    key: `paper/${attemptId}`
+  });
+  const state = stored?.value;
+  if (!state?.paperData) throw { code: "not_found", message: "\u8BD5\u5377\u5B9E\u4F8B\u4E0D\u5B58\u5728" };
+  const score = await readPaperScore(fetcher, auth, state.paperData);
+  log(
+    "info",
+    `exam readback status=${score.status ?? "?"} score=${score.paperScore?.userScore ?? score.totalScore ?? "?"}`
+  );
+  return {
+    confirmed: score.status === 1,
+    attempt_id: attemptId,
+    score: score.paperScore?.userScore ?? score.totalScore ?? null,
+    graded_answers: [],
+    review: null
+  };
+}
+async function examReview(params) {
+  const session = String(params.session ?? "");
+  let attemptId = String(params.attempt_id ?? "");
+  if (!attemptId && params.paper_id) {
+    const latest = await hostCall("cw.state", {
+      session,
+      namespace: "exam",
+      key: `latest/${String(params.paper_id)}`
+    });
+    attemptId = String(latest?.value ?? "");
+  }
+  if (!attemptId) return { ready: false };
+  const stored = await hostCall("cw.state", {
+    session,
+    namespace: "exam",
+    key: `paper/${attemptId}`
+  });
+  const state = stored?.value;
+  if (!state?.paperData) return { ready: false };
+  return { ready: true, attempt: toExamAttempt(state.paperData) };
 }
 async function catalogCourses(params) {
   const session = String(params.session ?? "");
@@ -2305,6 +2944,20 @@ async function dispatch(method, params) {
       return catalogCourses(params);
     case "catalog.units":
       return catalogUnits(params);
+    case "catalog.papers":
+      return catalogPapers(params);
+    case "exam.open":
+      return examOpen(params);
+    case "exam.write":
+      return examWrite(params);
+    case "exam.readback":
+      return examReadback(params);
+    case "exam.review":
+      return examReview(params);
+    case "exam.redo":
+      return examOpen(params);
+    case "exam.heartbeat":
+      return { ok: true };
     case "study.step":
       return studyStep(params);
     default:

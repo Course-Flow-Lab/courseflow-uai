@@ -12,8 +12,8 @@
 | `catalog.courses` | ✅ 配置课程（`course_id` / `course_name`） |
 | `catalog.units` | ✅ 真实课程树：视频 / 阅读 / 题目活动，带进度回读 |
 | `study.step` | ✅ 视频/阅读 `finishNode`；客观题 `submitScore`；主观题 `judgeStart`/`judgeResult`/`submitScore` |
-| `exam.*` / Unit Test / 挑战卷 | ❌ 未实现 |
-| `oral` / 上传 / 讨论 | ❌ 未实现 |
+| `catalog.papers` | ✅ 8 个挑战卷 + 8 个 Unit Test（从课程树/章节结构提取） |
+| `exam.*` | ✅ 挑战卷 create → 提交 → 分数确认；Unit Test create / 草稿 / 交卷 / 回读 |
 
 ## 登录模式
 
@@ -120,15 +120,15 @@ npm run build   # esbuild → index.mjs
 ## 已知限制
 
 - `live` 的 CAS 登录、浏览器内 reader token、课程树、视频完成已实测通过。
-- 章节题目已接入：客观题走 `submitScore`；主观题走 `judgeStart` → `judgeResult` → `submitScore`。
-- `judgeResult` 在 2 次轮询内未返回评语时，仍会带 `bizAnswerId` 提交；平台可能稍后才给出分数，任务先按已完成处理。
-- **章节题目需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
-- Unit Test、挑战卷、上传、口语尚未实现。
+- 挑战卷已实测：5 题 → `submitUserPaperAnswer` → `submitUserChallengeScore` → `userScore=5`，平台确认 100 分。
+- Unit Test 可以创建实例并解析 26 题；部分题型（匹配/特殊文本）模型答案无法自动匹配，框架会暂停要求人工补答。
+- Unit Test 的草稿/交卷/回读代码已接入，但**尚未完成一次全自动交卷验收**。
+- **章节题目和考试都需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
+- 上传、口语、讨论尚未实现。
 - 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
 
 ## 下一步
 
-1. 在 Courseflow 中配置模型，验收章节客观题提交。
-2. 接入主观题 judgeStart / judgeResult / submitScore。
-3. 迁移 Unit Test / 挑战卷到 `exam.*`。
-4. 上传、口语（口语优先走 `cw.browser` 或返回 `needs_human`）。
+1. 完善 Unit Test 的题型映射（matching / 特殊文本）并完成一次全自动交卷。
+2. 上传、口语、讨论。
+3. 口语优先走 `cw.browser` 或返回 `needs_human`。

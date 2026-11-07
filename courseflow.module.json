@@ -11,10 +11,13 @@
     "name": "U校园（骨架）",
     "short": "U校园",
     "login": ["password"],
-    "operations": ["study", "trial"],
+    "operations": ["study", "trial", "answer"],
     "unit_kinds": ["video", "reading", "document"],
     "presentation": {
-      "tabs": [{ "id": "study", "label": "学习目录" }],
+      "tabs": [
+        { "id": "study", "label": "学习目录" },
+        { "id": "answer", "label": "作业与考试" }
+      ],
       "actions": []
     }
   },
