@@ -752,6 +752,10 @@ var AI_GRADED = /* @__PURE__ */ new Set([
   "translation",
   "oral_personal_state"
 ]);
+function judgeable(extraTypes) {
+  if (!extraTypes || extraTypes.length === 0) return AI_GRADED;
+  return /* @__PURE__ */ new Set([...AI_GRADED, ...extraTypes]);
+}
 function buildChapterSubmissions(questions, answers) {
   const byId = new Map(answers.map((answer) => [answer.questionId, answer]));
   const groups = /* @__PURE__ */ new Map();
@@ -917,6 +921,64 @@ function buildChapterSubmitPayload(meta, submission) {
     b
   };
 }
+function buildChapterJudgePayload(meta, submission, extraTypes) {
+  const a = meta.timestamp ?? Date.now();
+  const b = meta.endTimestamp ?? a;
+  const allowed = judgeable(extraTypes);
+  return {
+    groupId: submission.groupId,
+    lan: "en",
+    userAnswers: submission.userAnswers.filter(
+      (record) => allowed.has(record.questionType) && record.userAnswerValue !== ""
+    ),
+    versionNumber: submission.versionNumber,
+    bookId: meta.bookId,
+    bookVersionNumber: meta.bookVersionNumber,
+    chapterId: meta.chapterId,
+    chapterVersionNumber: meta.chapterVersionNumber,
+    a,
+    b
+  };
+}
+function buildChapterJudgeResultPayload(submission, bizAnswerIds, extraTypes) {
+  const allowed = judgeable(extraTypes);
+  const userAnswers = submission.userAnswers.filter(
+    (record) => allowed.has(record.questionType) && record.userAnswerValue !== "" && bizAnswerIds[record.childId]
+  ).map((record) => ({
+    questionId: record.questionId,
+    childId: record.childId,
+    questionType: record.questionType,
+    userAnswerValue: record.userAnswerValue,
+    bizAnswerId: bizAnswerIds[record.childId]
+  }));
+  return { userAnswers, versionNumber: submission.versionNumber };
+}
+function buildChapterJudgeSubmitPayload(meta, submission, bizAnswerIds) {
+  const a = meta.timestamp ?? Date.now();
+  const b = meta.endTimestamp ?? a;
+  return {
+    groupId: submission.groupId,
+    versionNumber: submission.versionNumber,
+    userAnswers: submission.userAnswers.map((record) => {
+      const bizAnswerId = bizAnswerIds[record.childId];
+      return {
+        childId: record.childId,
+        questionType: record.questionType,
+        userAnswerValue: record.userAnswerValue,
+        ...bizAnswerId ? {
+          ...record.questionId ? { questionId: record.questionId } : {},
+          bizAnswerId
+        } : {}
+      };
+    }),
+    bookId: meta.bookId,
+    bookVersionNumber: meta.bookVersionNumber,
+    chapterId: meta.chapterId,
+    chapterVersionNumber: meta.chapterVersionNumber,
+    a,
+    b
+  };
+}
 async function postJson(options, path, meta, payload, fetcher) {
   const a = Number(payload.a ?? Date.now());
   const response = await fetcher(`${options.baseUrl ?? DEFAULT_BASE_URL}${path}`, {
@@ -947,6 +1009,114 @@ async function submitChapterScore(options, meta, submission, fetcher = fetch) {
     buildChapterSubmitPayload(meta, submission),
     fetcher
   );
+}
+function asRecord(value) {
+  return value && typeof value === "object" ? value : {};
+}
+async function submitChapterJudge(options, meta, submission, judgeOptions = {}) {
+  const fetcher = judgeOptions.fetcher ?? fetch;
+  const sleep = judgeOptions.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const pollIntervalMs = judgeOptions.pollIntervalMs ?? 1500;
+  const maxAttempts = judgeOptions.maxAttempts ?? 20;
+  const warnings = [];
+  const responses = {};
+  const judgeSubmission = {
+    ...submission,
+    userAnswers: submission.userAnswers.filter(
+      (record) => judgeable(judgeOptions.extraQuestionTypes).has(record.questionType) && record.userAnswerValue !== ""
+    )
+  };
+  if (judgeSubmission.userAnswers.length === 0) {
+    const score2 = await submitChapterScore(options, meta, submission, fetcher);
+    responses.score = score2;
+    return {
+      judgeTaskList: [],
+      results: [],
+      ...typeof asRecord(score2.json).data?.score === "number" ? { score: asRecord(score2.json).data.score } : {},
+      polls: 0,
+      warnings: ["no AI-graded answers; used submitScore directly"],
+      responses
+    };
+  }
+  const start = await postJson(
+    options,
+    "/api/reader/answer/judgeStart",
+    meta,
+    buildChapterJudgePayload(
+      meta,
+      judgeSubmission,
+      judgeOptions.extraQuestionTypes
+    ),
+    fetcher
+  );
+  responses.start = start;
+  if (!start.ok) {
+    warnings.push(`judgeStart failed: HTTP ${start.status} ${start.body.slice(0, 160)}`);
+    return { judgeTaskList: [], results: [], polls: 0, warnings, responses };
+  }
+  const taskList = asRecord(asRecord(start.json).data).judgeTaskList;
+  const judgeTaskList = Array.isArray(taskList) ? taskList.map((task) => ({
+    childId: String(task?.childId ?? ""),
+    bizAnswerId: String(task?.bizAnswerId ?? "")
+  })).filter((task) => task.childId && task.bizAnswerId) : [];
+  const bizAnswerIds = {};
+  for (const task of judgeTaskList) bizAnswerIds[task.childId] = task.bizAnswerId;
+  if (judgeTaskList.length === 0) {
+    warnings.push("judgeStart returned no judgeTaskList");
+  }
+  let results = [];
+  let polls = 0;
+  for (let attempt = 0; judgeTaskList.length > 0 && attempt < maxAttempts; attempt += 1) {
+    await sleep(pollIntervalMs);
+    const poll = await postJson(
+      options,
+      "/api/reader/answer/judgeResult",
+      meta,
+      buildChapterJudgeResultPayload(
+        judgeSubmission,
+        bizAnswerIds,
+        judgeOptions.extraQuestionTypes
+      ),
+      fetcher
+    );
+    polls += 1;
+    responses.result = poll;
+    if (!poll.ok) {
+      warnings.push(`judgeResult failed: HTTP ${poll.status}`);
+      break;
+    }
+    const items = asRecord(asRecord(poll.json).data).userAnswersResult;
+    if (Array.isArray(items) && items.length > 0) {
+      results = items;
+      const done = results.every(
+        (item) => Boolean(item.evaluation) || (item.status ?? 0) !== 0
+      );
+      if (done) break;
+    }
+  }
+  if (results.length > 0 && !results.every((item) => Boolean(item.evaluation))) {
+    warnings.push("judgeResult did not return an evaluation before timeout");
+  }
+  const score = await postJson(
+    options,
+    "/api/reader/answer/submitScore",
+    meta,
+    buildChapterJudgeSubmitPayload(meta, submission, bizAnswerIds),
+    fetcher
+  );
+  responses.score = score;
+  if (!score.ok) {
+    warnings.push(`submitScore failed: HTTP ${score.status}`);
+  }
+  const scoreValue = asRecord(asRecord(score.json).data).score;
+  return {
+    judgeTaskList,
+    results,
+    ...typeof scoreValue === "number" ? { score: scoreValue } : {},
+    polls,
+    warnings,
+    responses
+  };
 }
 async function fetchChapterAnswerList(options, groupId, versionNumber, fetcher = fetch) {
   const url = `${options.baseUrl ?? DEFAULT_BASE_URL}/api/reader/answer/list?questionId=${encodeURIComponent(groupId)}&versionNumber=${encodeURIComponent(versionNumber)}`;
@@ -1568,7 +1738,7 @@ function hostFetchFor(session) {
     delete headers["content-length"];
     const rawBody = init.body;
     const body = rawBody === void 0 || rawBody === null ? void 0 : typeof rawBody === "string" ? rawBody : String(rawBody);
-    const stage = /\/api\/reader\/action\/finishNode|\/api\/reader\/answer\/submitScore/.test(url) ? "save_study" : "read";
+    const stage = /\/api\/reader\/action\/finishNode|\/api\/reader\/answer\/submitScore|\/api\/reader\/answer\/judgeStart|\/api\/reader\/answer\/judgeResult/.test(url) ? "save_study" : "read";
     const response = await hostCall("cw.net.fetch", {
       session,
       method: String(init.method ?? "GET").toUpperCase(),
@@ -1740,10 +1910,23 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
     }
     const { submissions, warnings } = buildChapterSubmissions(activity.questions, answers);
     if (warnings.length > 0) log("warn", `chapter warnings: ${warnings.join("; ")}`);
-    if (submissions.some((submission) => submission.mode === "judge")) {
-      return { status: "needs_human", reason: "\u4E3B\u89C2\u9898\u9700\u8981 AI \u5224\u5206\uFF0C\u6682\u672A\u63A5\u5165" };
-    }
     for (const submission of submissions) {
+      if (submission.mode === "judge") {
+        const outcome = await submitChapterJudge(
+          { token: auth.token, baseUrl: IPUB_BASE },
+          meta,
+          submission,
+          { fetcher, maxAttempts: 2, pollIntervalMs: 1e3 }
+        );
+        log(
+          "info",
+          `judge ${submission.groupId} polls=${outcome.polls} score=${outcome.score ?? "pending"}` + (outcome.warnings.length > 0 ? ` warnings=${outcome.warnings.join("; ")}` : "")
+        );
+        if (!outcome.responses.score?.ok) {
+          log("warn", `judge submitScore not ok for ${submission.groupId}`);
+        }
+        continue;
+      }
       const result = await submitChapterScore(
         { token: auth.token, baseUrl: IPUB_BASE },
         meta,

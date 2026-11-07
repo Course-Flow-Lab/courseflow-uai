@@ -11,7 +11,7 @@
 | `auth.verify` / `auth.keepalive` | ✅ 基础实现 |
 | `catalog.courses` | ✅ 配置课程（`course_id` / `course_name`） |
 | `catalog.units` | ✅ 真实课程树：视频 / 阅读 / 题目活动，带进度回读 |
-| `study.step` | ✅ 视频/阅读 `finishNode`；客观题 `cw.ai.generate` + `submitScore` + `answer/list` 回读 |
+| `study.step` | ✅ 视频/阅读 `finishNode`；客观题 `submitScore`；主观题 `judgeStart`/`judgeResult`/`submitScore` |
 | `exam.*` / Unit Test / 挑战卷 | ❌ 未实现 |
 | `oral` / 上传 / 讨论 | ❌ 未实现 |
 
@@ -120,9 +120,9 @@ npm run build   # esbuild → index.mjs
 ## 已知限制
 
 - `live` 的 CAS 登录、浏览器内 reader token、课程树、视频完成已实测通过。
-- 章节题目已接入：`catalog.units` 会列出题目活动，客观题走 `cw.ai.generate` → `submitScore` → `answer/list`。
+- 章节题目已接入：客观题走 `submitScore`；主观题走 `judgeStart` → `judgeResult` → `submitScore`。
+- `judgeResult` 在 2 次轮询内未返回评语时，仍会带 `bizAnswerId` 提交；平台可能稍后才给出分数，任务先按已完成处理。
 - **章节题目需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
-- 主观题（writing / translation / oral / short_answer）目前返回 `needs_human`，尚未接入 judge 链路。
 - Unit Test、挑战卷、上传、口语尚未实现。
 - 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
 

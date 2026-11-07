@@ -30,6 +30,7 @@ import {
   buildChapterSubmissions,
   fetchChapterAnswerList,
   fetchChapterStructure,
+  submitChapterJudge,
   submitChapterScore,
 } from './vendor/chapter-api.js';
 
@@ -560,7 +561,7 @@ function hostFetchFor(session: string) {
         : typeof rawBody === 'string'
           ? rawBody
           : String(rawBody);
-    const stage = /\/api\/reader\/action\/finishNode|\/api\/reader\/answer\/submitScore/.test(url)
+    const stage = /\/api\/reader\/action\/finishNode|\/api\/reader\/answer\/submitScore|\/api\/reader\/answer\/judgeStart|\/api\/reader\/answer\/judgeResult/.test(url)
       ? 'save_study'
       : 'read';
     const response = await hostCall('cw.net.fetch', {
@@ -780,10 +781,24 @@ async function studyQuestionStep(
     }
     const { submissions, warnings } = buildChapterSubmissions(activity.questions, answers);
     if (warnings.length > 0) log('warn', `chapter warnings: ${warnings.join('; ')}`);
-    if (submissions.some((submission: any) => submission.mode === 'judge')) {
-      return { status: 'needs_human', reason: '主观题需要 AI 判分，暂未接入' };
-    }
     for (const submission of submissions) {
+      if (submission.mode === 'judge') {
+        const outcome = await submitChapterJudge(
+          { token: auth.token, baseUrl: IPUB_BASE },
+          meta,
+          submission,
+          { fetcher, maxAttempts: 2, pollIntervalMs: 1000 },
+        );
+        log(
+          'info',
+          `judge ${submission.groupId} polls=${outcome.polls} score=${outcome.score ?? 'pending'}` +
+            (outcome.warnings.length > 0 ? ` warnings=${outcome.warnings.join('; ')}` : ''),
+        );
+        if (!outcome.responses.score?.ok) {
+          log('warn', `judge submitScore not ok for ${submission.groupId}`);
+        }
+        continue;
+      }
       const result = await submitChapterScore(
         { token: auth.token, baseUrl: IPUB_BASE },
         meta,
