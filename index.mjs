@@ -337,6 +337,14 @@ var UCONTENT_BASE = "https://ucontent.unipus.cn";
 var LOGIN_AES_KEY2 = Buffer.from("8AD70B641C024C7ADA2ECD082EC0334F", "hex");
 var LOGIN_AES_IV2 = Buffer.from("0102030405060708090A0B0C0D0E0F10", "hex");
 var ANNOTATOR_SECRET2 = "a824b379f126b8b7aa5e33dee83fb0a05aa7462c";
+var BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+var BROWSER_HEADERS = {
+  "user-agent": BROWSER_UA,
+  "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+  "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"'
+};
 var write = (message) => process.stdout.write(`${JSON.stringify(message)}
 `);
 var log = (level, message) => process.stderr.write(`[unipus] ${level} ${message}
@@ -449,7 +457,11 @@ async function liveLogin(session, username, password) {
     session,
     method: "GET",
     url: loginPage,
-    stage: "read"
+    stage: "read",
+    headers: {
+      ...BROWSER_HEADERS,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
   });
   const loginResponse = await hostCall("cw.net.fetch", {
     session,
@@ -458,6 +470,7 @@ async function liveLogin(session, username, password) {
     encoding: "json",
     stage: "read",
     headers: {
+      ...BROWSER_HEADERS,
       origin: SSO_BASE,
       referer: loginPage,
       accept: "application/json, text/plain, */*"
@@ -486,12 +499,21 @@ async function liveLogin(session, username, password) {
   if (!ticket) throw new Error("SSO \u672A\u8FD4\u56DE serviceTicket");
   if (!openId) throw new Error("SSO \u672A\u8FD4\u56DE openid");
   const redeem = service.includes("?") ? `${service}&ticket=${ticket}` : `${service}?ticket=${ticket}`;
-  await hostCall("cw.net.fetch", {
-    session,
-    method: "GET",
-    url: redeem,
-    stage: "read"
-  });
+  try {
+    await hostCall("cw.net.fetch", {
+      session,
+      method: "GET",
+      url: redeem,
+      stage: "read",
+      headers: {
+        ...BROWSER_HEADERS,
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      }
+    });
+  } catch (error) {
+    if (error?.code !== "platform_verification_required") throw error;
+    log("warn", "ticket redeem returned 403; continuing with captured cookies");
+  }
   if (!COURSE_ID) {
     throw new Error("live \u6A21\u5F0F\u9700\u8981\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u63D0\u4F9B course_id\uFF08reader token \u4EA4\u6362\u7528\uFF09");
   }

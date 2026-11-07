@@ -65,6 +65,17 @@ const LOGIN_AES_KEY = Buffer.from('8AD70B641C024C7ADA2ECD082EC0334F', 'hex');
 const LOGIN_AES_IV = Buffer.from('0102030405060708090A0B0C0D0E0F10', 'hex');
 const ANNOTATOR_SECRET = 'a824b379f126b8b7aa5e33dee83fb0a05aa7462c';
 
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const BROWSER_HEADERS = {
+  'user-agent': BROWSER_UA,
+  'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+  'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+};
+
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const log = (level, message) => process.stderr.write(`[unipus] ${level} ${message}\n`);
 
@@ -202,6 +213,10 @@ async function liveLogin(session, username, password) {
     method: 'GET',
     url: loginPage,
     stage: 'read',
+    headers: {
+      ...BROWSER_HEADERS,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
   });
 
   const loginResponse = await hostCall('cw.net.fetch', {
@@ -211,6 +226,7 @@ async function liveLogin(session, username, password) {
     encoding: 'json',
     stage: 'read',
     headers: {
+      ...BROWSER_HEADERS,
       origin: SSO_BASE,
       referer: loginPage,
       accept: 'application/json, text/plain, */*',
@@ -241,12 +257,23 @@ async function liveLogin(session, username, password) {
   if (!openId) throw new Error('SSO 未返回 openid');
 
   const redeem = service.includes('?') ? `${service}&ticket=${ticket}` : `${service}?ticket=${ticket}`;
-  await hostCall('cw.net.fetch', {
-    session,
-    method: 'GET',
-    url: redeem,
-    stage: 'read',
-  });
+  try {
+    await hostCall('cw.net.fetch', {
+      session,
+      method: 'GET',
+      url: redeem,
+      stage: 'read',
+      headers: {
+        ...BROWSER_HEADERS,
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+    });
+  } catch (error) {
+    // The redeem page can answer 403 while still setting the `jwt` cookie.
+    // The browser token exchange is the authoritative next step, so keep going.
+    if (error?.code !== 'platform_verification_required') throw error;
+    log('warn', 'ticket redeem returned 403; continuing with captured cookies');
+  }
 
   if (!COURSE_ID) {
     throw new Error('live 模式需要在模块设置里提供 course_id（reader token 交换用）');
