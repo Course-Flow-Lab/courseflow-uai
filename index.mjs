@@ -2573,6 +2573,10 @@ async function waitForSubmitSlot(session) {
 function isRetryableStatus(status) {
   return status === 408 || status === 429 || status >= 500;
 }
+function isRetryableError(error) {
+  const code = String(error?.code ?? "");
+  return code === "platform_unavailable" || code === "platform_timeout" || code === "net_unavailable";
+}
 async function withRetry(run, attempts = 3, baseDelayMs = 800) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -2588,7 +2592,7 @@ async function withRetry(run, attempts = 3, baseDelayMs = 800) {
       return value;
     } catch (error) {
       lastError = error;
-      if (attempt >= attempts) break;
+      if (!isRetryableError(error) || attempt >= attempts) break;
       await new Promise(
         (resolve) => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1))
       );
@@ -2596,32 +2600,66 @@ async function withRetry(run, attempts = 3, baseDelayMs = 800) {
   }
   throw lastError ?? new Error("retry failed");
 }
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
 async function solveQuestions(session, activity) {
-  const payload = (activity.questions ?? []).filter((question) => !isOralQuestion(question)).map((question) => ({
-    id: question.id,
-    type: question.type,
-    stem: question.stem,
-    options: (question.options ?? []).map((option) => option.text),
-    blanks: question.blankCount ?? 0,
-    ...question.passage ? { passage: question.passage } : {}
-  }));
-  const prompt = [
-    "\u4F60\u662F U\u6821\u56ED \u82F1\u8BED\u8BFE\u7A0B\u7B54\u9898\u52A9\u624B\u3002",
-    '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
-    "\u9009\u62E9\u9898 texts \u5FC5\u987B\u662F\u9009\u9879\u539F\u6587\uFF0C\u4E0D\u8981\u7528 A/B/C/D\u3002",
-    "\u586B\u7A7A\u9898\u6309\u7A7A\u4F4D\u987A\u5E8F\u7ED9\u51FA\u591A\u4E2A texts\u3002",
-    JSON.stringify(payload)
-  ].join("\n");
-  const response = await hostCall("cw.ai.generate", { session, prompt });
-  const raw = String(response?.text ?? "").trim();
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
-  const parsed = JSON.parse(cleaned);
+  const questions = (activity.questions ?? []).filter(
+    (question) => !isOralQuestion(question)
+  );
   const byId = /* @__PURE__ */ new Map();
-  for (const item of Array.isArray(parsed) ? parsed : []) {
-    if (!item || typeof item !== "object") continue;
-    const id = String(item.id ?? "");
-    const texts = Array.isArray(item.texts) ? item.texts.map(String) : [];
-    if (id) byId.set(id, texts);
+  const batches = chunkArray(questions, 8);
+  for (const [batchIndex, batch] of batches.entries()) {
+    const payload = batch.map((question) => ({
+      id: question.id,
+      type: question.rawType ?? question.type,
+      stem: question.stem,
+      options: (question.options ?? []).map((option) => option.text),
+      blanks: question.blankCount ?? 0,
+      ...question.passage ? { passage: question.passage } : {},
+      ...question.instruction ? { instruction: question.instruction } : {}
+    }));
+    const prompt = [
+      "\u4F60\u662F U\u6821\u56ED \u82F1\u8BED\u8BFE\u7A0B\u7B54\u9898\u52A9\u624B\u3002",
+      '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
+      "\u9009\u62E9\u9898 texts \u5FC5\u987B\u662F\u9009\u9879\u539F\u6587\uFF0C\u4E0D\u8981\u7528 A/B/C/D\u3002",
+      "\u586B\u7A7A\u9898\u6309\u7A7A\u4F4D\u987A\u5E8F\u7ED9\u51FA\u591A\u4E2A texts\u3002",
+      JSON.stringify(payload)
+    ].join("\n");
+    let parsed = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await hostCall("cw.ai.generate", {
+        session,
+        prompt: attempt === 0 ? prompt : `${prompt}
+\u4E0A\u6B21\u8F93\u51FA\u4E0D\u662F\u5408\u6CD5 JSON \u6570\u7EC4\uFF1B\u8FD9\u6B21\u53EA\u8F93\u51FA JSON\uFF0C\u4E0D\u8981 Markdown\u3002`
+      });
+      const raw = String(response?.text ?? "").trim();
+      const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+      try {
+        parsed = JSON.parse(cleaned);
+        break;
+      } catch {
+        log(
+          "warn",
+          `solve batch ${batchIndex + 1}/${batches.length} returned invalid JSON (attempt ${attempt + 1})`
+        );
+      }
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `\u6A21\u578B\u6CA1\u6709\u8FD4\u56DE\u5408\u6CD5\u7B54\u6848 JSON\uFF08\u6279\u6B21 ${batchIndex + 1}/${batches.length}\uFF09`
+      );
+    }
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const id = String(item.id ?? "");
+      const texts = Array.isArray(item.texts) ? item.texts.map(String) : [];
+      if (id) byId.set(id, texts);
+    }
   }
   return (activity.questions ?? []).map((question) => ({
     questionId: question.id,
@@ -3165,10 +3203,9 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
       const { submissions, warnings } = buildChapterSubmissions(pendingQuestions, answers);
       if (warnings.length > 0) log("warn", `chapter warnings: ${warnings.join("; ")}`);
       if (submissions.length === 0) {
-        return {
-          status: "needs_human",
-          reason: `\u9898\u7EC4 ${groupId} \u6CA1\u6709\u751F\u6210\u53EF\u63D0\u4EA4\u7684\u7B54\u6848\uFF0C\u9700\u8981\u4EBA\u5DE5\u68C0\u67E5`
-        };
+        const reason = `\u9898\u7EC4 ${groupId} \u6CA1\u6709\u751F\u6210\u53EF\u63D0\u4EA4\u7684\u7B54\u6848\uFF0C\u9700\u8981\u4EBA\u5DE5\u68C0\u67E5`;
+        await blockGroup(session, cfg.bookId, groupId, reason);
+        return { status: "needs_human", reason };
       }
       const submission = submissions[0];
       const questions = pendingQuestions;
@@ -3528,18 +3565,29 @@ async function catalogPapers(params) {
   for (let index = 0; index < metas.length; index += 4) {
     const chunk = metas.slice(index, index + 4);
     const results = await Promise.all(
-      chunk.map((meta) => readPaperStatus(fetcher, auth, meta).catch(() => ({ done: false, score: null })))
+      chunk.map(
+        (meta) => readPaperStatus(fetcher, auth, meta).catch(() => ({
+          done: false,
+          score: null,
+          unknown: true
+        }))
+      )
     );
     chunk.forEach((meta, offset) => statuses.set(meta.paperId, results[offset]));
   }
   return {
     papers: metas.map((meta) => {
-      const status = statuses.get(meta.paperId) ?? { done: false, score: null };
+      const status = statuses.get(meta.paperId) ?? {
+        done: false,
+        score: null,
+        unknown: false
+      };
       return {
         id: meta.paperId,
         name: meta.paperName,
         category: meta.paperType === 3 ? "unit_test" : "challenge",
-        available: true,
+        available: !status.unknown,
+        ...status.unknown ? { reason: "\u8BD5\u5377\u72B6\u6001\u8BFB\u53D6\u5931\u8D25\uFF0C\u8BF7\u5237\u65B0\u76EE\u5F55\u540E\u91CD\u8BD5" } : {},
         done: status.done,
         can_redo: true,
         can_review: true,
@@ -3701,16 +3749,31 @@ async function fetchLatestPaper(fetcher, auth, meta) {
       })
     }
   );
-  const json = await response.json().catch(() => null);
-  return json?.code === 200 && json.data ? json.data : null;
+  const text = await response.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`getLatestPaperInstance \u8FD4\u56DE\u975E JSON\uFF08HTTP ${response.status}\uFF09`);
+  }
+  if (json?.code !== 200) {
+    throw new Error(
+      `getLatestPaperInstance failed: ${json?.message ?? `code ${json?.code}`}`
+    );
+  }
+  return json.data ?? null;
 }
 async function readPaperStatus(fetcher, auth, meta) {
   const key = paperStatusKey(meta);
   const cached = paperStatusCache.get(key);
-  if (cached && (cached.done || Date.now() - cached.at < 2e4)) {
-    return { done: cached.done, score: cached.score };
+  if (cached && (cached.done || Date.now() - cached.at < (cached.unknown ? 5e3 : 2e4))) {
+    return { done: cached.done, score: cached.score, unknown: cached.unknown };
   }
-  let value = { done: false, score: null };
+  let value = {
+    done: false,
+    score: null,
+    unknown: false
+  };
   try {
     const latest = await fetchLatestPaper(fetcher, auth, meta);
     if (latest?.instanceId) {
@@ -3723,11 +3786,13 @@ async function readPaperStatus(fetcher, auth, meta) {
       const score = await readPaperScore(fetcher, auth, paperData);
       value = {
         done: score.status === 1,
-        score: score.paperScore?.userScore ?? score.totalScore ?? null
+        score: score.paperScore?.userScore ?? score.totalScore ?? null,
+        unknown: false
       };
     }
   } catch (error) {
     log("warn", `paper status ${meta.paperId} failed: ${errorText(error)}`);
+    value = { done: false, score: null, unknown: true };
   }
   paperStatusCache.set(key, { ...value, at: Date.now() });
   return value;
@@ -3748,8 +3813,16 @@ async function examOpen(params) {
   const forceNew = params.force_new === true;
   const statusKey = paperStatusKey(meta);
   let paperData;
-  if (!forceNew) {
-    const latest = await fetchLatestPaper(fetcher, auth, meta);
+  if (!forceNew && meta.paperType === 3) {
+    let latest;
+    try {
+      latest = await fetchLatestPaper(fetcher, auth, meta);
+    } catch (error) {
+      throw {
+        code: "platform_unavailable",
+        message: `\u65E0\u6CD5\u8BFB\u53D6\u8BD5\u5377\u6700\u65B0\u5B9E\u4F8B\uFF1A${errorText(error)}`
+      };
+    }
     if (latest?.instanceId) {
       const candidate = {
         ...parsePaperData(latest),
@@ -3762,6 +3835,7 @@ async function examOpen(params) {
         paperStatusCache.set(statusKey, {
           done: true,
           score: score.paperScore?.userScore ?? score.totalScore ?? null,
+          unknown: false,
           at: Date.now()
         });
         throw {
@@ -3789,7 +3863,7 @@ async function examOpen(params) {
   if (!paperData.instanceId) throw new Error("\u8BD5\u5377\u5B9E\u4F8B\u7F3A\u5C11 instanceId");
   log(
     "info",
-    `exam open ${paperData.paperId} ` + (paperData.questions ?? []).map((question) => `${question.rawType}:${question.type}:${question.blankCount}:${question.options?.length ?? 0}`).join(",")
+    `exam open ${paperData.paperId} instance=${paperData.instanceId} ` + (paperData.questions ?? []).map((question) => `${question.rawType}:${question.type}:${question.blankCount}:${question.options?.length ?? 0}`).join(",")
   );
   await hostCall("cw.state", {
     session,
@@ -3941,6 +4015,7 @@ async function examReadback(params) {
     paperStatusCache.set(paperStatusKey(state.meta), {
       done: true,
       score: userScore,
+      unknown: false,
       at: Date.now()
     });
   }

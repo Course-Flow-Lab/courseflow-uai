@@ -135,8 +135,10 @@ npm run build   # esbuild → index.mjs
 - Unit Test / 挑战卷交卷遇到 417 风控时会明确提示“草稿已保存，请到官方页面手动交卷”。
 - 框架支持 `CF_HTTP_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`，模块的 HTTP 请求和官方 Chromium 都会走该代理。
 - 题目活动完成后会写入模块状态，`catalog.units` 里的 `q::` 活动会显示 `completed`，后续 job 不再重做。
-- 试卷会先查最新实例：未交卷的续答，已交卷的跳过；`exam.redo` 才会新建实例。
-- `catalog.papers` 会回读 `done` / `score`，Unit Test 和挑战卷都能显示实际状态。
+- 试卷会先查最新实例：**只有 Unit Test 续答**；挑战卷始终新建实例，避免复用过期挑战卷。已交卷的试卷会跳过；`exam.redo` 才会新建 Unit Test 实例。
+- 试卷状态读取失败时，目录会把该试卷标记为不可用并给出原因，不会误判为“未交卷”而重复开卷。
+- 章节答案按 8 题一批求解；模型返回非法 JSON 会自动重试一次。
+- 主观题只要平台已保存答案就算通过（不强制 100）；自动评分客观题仍要求 100。
 - **章节题目和考试都需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
 - 上传已实测：Unit 7 多媒体上传 → COS PUT 200 → `submitScore` 200 → `unit_completed`。
 - 口语已实测：AI 生成 30–45 词答案 → 百度 TTS → 浏览器内转 16 kHz WAV → SOE WebSocket 评测（81 分）→ COS 上传 → 回读平台评测 → `submitScore` 200。

@@ -1049,6 +1049,15 @@ function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
+function isRetryableError(error: unknown): boolean {
+  const code = String((error as any)?.code ?? '');
+  return (
+    code === 'platform_unavailable' ||
+    code === 'platform_timeout' ||
+    code === 'net_unavailable'
+  );
+}
+
 async function withRetry<T>(
   run: (attempt: number) => Promise<T>,
   attempts = 3,
@@ -1068,7 +1077,7 @@ async function withRetry<T>(
       return value;
     } catch (error) {
       lastError = error;
-      if (attempt >= attempts) break;
+      if (!isRetryableError(error) || attempt >= attempts) break;
       await new Promise((resolve) =>
         setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)),
       );
@@ -1077,34 +1086,72 @@ async function withRetry<T>(
   throw lastError ?? new Error('retry failed');
 }
 
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
 async function solveQuestions(session: string, activity: any): Promise<any[]> {
-  const payload = (activity.questions ?? [])
-    .filter((question: any) => !isOralQuestion(question))
-    .map((question: any) => ({
-    id: question.id,
-    type: question.type,
-    stem: question.stem,
-    options: (question.options ?? []).map((option: any) => option.text),
-    blanks: question.blankCount ?? 0,
-    ...(question.passage ? { passage: question.passage } : {}),
-  }));
-  const prompt = [
-    '你是 U校园 英语课程答题助手。',
-    '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
-    '选择题 texts 必须是选项原文，不要用 A/B/C/D。',
-    '填空题按空位顺序给出多个 texts。',
-    JSON.stringify(payload),
-  ].join('\n');
-  const response = await hostCall('cw.ai.generate', { session, prompt });
-  const raw = String((response as any)?.text ?? '').trim();
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
-  const parsed = JSON.parse(cleaned);
+  const questions = (activity.questions ?? []).filter(
+    (question: any) => !isOralQuestion(question),
+  );
   const byId = new Map<string, string[]>();
-  for (const item of Array.isArray(parsed) ? parsed : []) {
-    if (!item || typeof item !== 'object') continue;
-    const id = String(item.id ?? '');
-    const texts = Array.isArray(item.texts) ? item.texts.map(String) : [];
-    if (id) byId.set(id, texts);
+  const batches = chunkArray(questions, 8);
+  for (const [batchIndex, batch] of batches.entries()) {
+    const payload = batch.map((question: any) => ({
+      id: question.id,
+      type: question.rawType ?? question.type,
+      stem: question.stem,
+      options: (question.options ?? []).map((option: any) => option.text),
+      blanks: question.blankCount ?? 0,
+      ...(question.passage ? { passage: question.passage } : {}),
+      ...(question.instruction ? { instruction: question.instruction } : {}),
+    }));
+    const prompt = [
+      '你是 U校园 英语课程答题助手。',
+      '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
+      '选择题 texts 必须是选项原文，不要用 A/B/C/D。',
+      '填空题按空位顺序给出多个 texts。',
+      JSON.stringify(payload),
+    ].join('\n');
+    let parsed: any = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await hostCall('cw.ai.generate', {
+        session,
+        prompt:
+          attempt === 0
+            ? prompt
+            : `${prompt}\n上次输出不是合法 JSON 数组；这次只输出 JSON，不要 Markdown。`,
+      });
+      const raw = String((response as any)?.text ?? '').trim();
+      const cleaned = raw
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+      try {
+        parsed = JSON.parse(cleaned);
+        break;
+      } catch {
+        log(
+          'warn',
+          `solve batch ${batchIndex + 1}/${batches.length} returned invalid JSON (attempt ${attempt + 1})`,
+        );
+      }
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `模型没有返回合法答案 JSON（批次 ${batchIndex + 1}/${batches.length}）`,
+      );
+    }
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') continue;
+      const id = String(item.id ?? '');
+      const texts = Array.isArray(item.texts) ? item.texts.map(String) : [];
+      if (id) byId.set(id, texts);
+    }
   }
   return (activity.questions ?? []).map((question: any) => ({
     questionId: question.id,
@@ -1728,10 +1775,9 @@ async function studyQuestionStep(
       const { submissions, warnings } = buildChapterSubmissions(pendingQuestions, answers);
       if (warnings.length > 0) log('warn', `chapter warnings: ${warnings.join('; ')}`);
       if (submissions.length === 0) {
-        return {
-          status: 'needs_human',
-          reason: `题组 ${groupId} 没有生成可提交的答案，需要人工检查`,
-        };
+        const reason = `题组 ${groupId} 没有生成可提交的答案，需要人工检查`;
+        await blockGroup(session, cfg.bookId, groupId, reason);
+        return { status: 'needs_human', reason };
       }
 
       const submission = submissions[0];
@@ -2120,22 +2166,38 @@ async function catalogPapers(params: any) {
   const fetcher: any = hostFetchFor(session);
   await refreshPapers(session, cfg, auth, fetcher);
   const metas = [...paperCache.values()];
-  const statuses = new Map<string, { done: boolean; score: number | null }>();
+  const statuses = new Map<
+    string,
+    { done: boolean; score: number | null; unknown: boolean }
+  >();
   for (let index = 0; index < metas.length; index += 4) {
     const chunk = metas.slice(index, index + 4);
     const results = await Promise.all(
-      chunk.map((meta) => readPaperStatus(fetcher, auth, meta).catch(() => ({ done: false, score: null }))),
+      chunk.map((meta) =>
+        readPaperStatus(fetcher, auth, meta).catch(() => ({
+          done: false,
+          score: null,
+          unknown: true,
+        })),
+      ),
     );
     chunk.forEach((meta, offset) => statuses.set(meta.paperId, results[offset]!));
   }
   return {
     papers: metas.map((meta) => {
-      const status = statuses.get(meta.paperId) ?? { done: false, score: null };
+      const status = statuses.get(meta.paperId) ?? {
+        done: false,
+        score: null,
+        unknown: false,
+      };
       return {
         id: meta.paperId,
         name: meta.paperName,
         category: meta.paperType === 3 ? 'unit_test' : 'challenge',
-        available: true,
+        available: !status.unknown,
+        ...(status.unknown
+          ? { reason: '试卷状态读取失败，请刷新目录后重试' }
+          : {}),
         done: status.done,
         can_redo: true,
         can_review: true,
@@ -2288,7 +2350,7 @@ async function readPaperScore(fetcher: any, auth: any, paperData: any) {
 
 const paperStatusCache = new Map<
   string,
-  { done: boolean; score: number | null; at: number }
+  { done: boolean; score: number | null; unknown: boolean; at: number }
 >();
 
 function paperStatusKey(meta: any): string {
@@ -2316,8 +2378,19 @@ async function fetchLatestPaper(
       }),
     },
   );
-  const json = await response.json().catch(() => null);
-  return json?.code === 200 && json.data ? json.data : null;
+  const text = await response.text();
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`getLatestPaperInstance 返回非 JSON（HTTP ${response.status}）`);
+  }
+  if (json?.code !== 200) {
+    throw new Error(
+      `getLatestPaperInstance failed: ${json?.message ?? `code ${json?.code}`}`,
+    );
+  }
+  return json.data ?? null;
 }
 
 /** Submitted/score state for one paper; submitted (`status === 1`) is sticky. */
@@ -2325,13 +2398,21 @@ async function readPaperStatus(
   fetcher: any,
   auth: any,
   meta: any,
-): Promise<{ done: boolean; score: number | null }> {
+): Promise<{ done: boolean; score: number | null; unknown: boolean }> {
   const key = paperStatusKey(meta);
   const cached = paperStatusCache.get(key);
-  if (cached && (cached.done || Date.now() - cached.at < 20_000)) {
-    return { done: cached.done, score: cached.score };
+  if (
+    cached &&
+    (cached.done ||
+      Date.now() - cached.at < (cached.unknown ? 5_000 : 20_000))
+  ) {
+    return { done: cached.done, score: cached.score, unknown: cached.unknown };
   }
-  let value: { done: boolean; score: number | null } = { done: false, score: null };
+  let value: { done: boolean; score: number | null; unknown: boolean } = {
+    done: false,
+    score: null,
+    unknown: false,
+  };
   try {
     const latest = await fetchLatestPaper(fetcher, auth, meta);
     if (latest?.instanceId) {
@@ -2345,10 +2426,12 @@ async function readPaperStatus(
       value = {
         done: score.status === 1,
         score: score.paperScore?.userScore ?? score.totalScore ?? null,
+        unknown: false,
       };
     }
   } catch (error) {
     log('warn', `paper status ${meta.paperId} failed: ${errorText(error)}`);
+    value = { done: false, score: null, unknown: true };
   }
   paperStatusCache.set(key, { ...value, at: Date.now() });
   return value;
@@ -2371,8 +2454,19 @@ async function examOpen(params: any) {
   const forceNew = params.force_new === true;
   const statusKey = paperStatusKey(meta);
   let paperData: any;
-  if (!forceNew) {
-    const latest = await fetchLatestPaper(fetcher, auth, meta);
+  // Only Unit Test attempts are resumed. A challenge paper is always a new
+  // attempt (unicheat's quiz behaves the same), so a stale/expired challenge
+  // instance can never block a fresh run.
+  if (!forceNew && meta.paperType === 3) {
+    let latest: any;
+    try {
+      latest = await fetchLatestPaper(fetcher, auth, meta);
+    } catch (error) {
+      throw {
+        code: 'platform_unavailable',
+        message: `无法读取试卷最新实例：${errorText(error)}`,
+      };
+    }
     if (latest?.instanceId) {
       const candidate = {
         ...parsePaperData(latest),
@@ -2385,6 +2479,7 @@ async function examOpen(params: any) {
         paperStatusCache.set(statusKey, {
           done: true,
           score: score.paperScore?.userScore ?? score.totalScore ?? null,
+          unknown: false,
           at: Date.now(),
         });
         throw {
@@ -2413,7 +2508,7 @@ async function examOpen(params: any) {
   if (!paperData.instanceId) throw new Error('试卷实例缺少 instanceId');
   log(
     'info',
-    `exam open ${paperData.paperId} ` +
+    `exam open ${paperData.paperId} instance=${paperData.instanceId} ` +
       (paperData.questions ?? [])
         .map((question: any) => `${question.rawType}:${question.type}:${question.blankCount}:${question.options?.length ?? 0}`)
         .join(','),
@@ -2578,6 +2673,7 @@ async function examReadback(params: any) {
     paperStatusCache.set(paperStatusKey(state.meta), {
       done: true,
       score: userScore,
+      unknown: false,
       at: Date.now(),
     });
   }
