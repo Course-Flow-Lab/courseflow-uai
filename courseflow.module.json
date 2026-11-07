@@ -12,7 +12,7 @@
     "short": "U校园",
     "login": ["password"],
     "operations": ["study", "trial"],
-    "unit_kinds": ["video", "reading", "document"],
+    "unit_kinds": ["video", "reading"],
     "presentation": {
       "tabs": [{ "id": "study", "label": "学习目录" }],
       "actions": []

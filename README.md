@@ -7,13 +7,13 @@
 | 方法 | 状态 |
 |---|---|
 | `platform.describe` | ✅ 与清单一致 |
-| `auth.begin` / `auth.poll` / `auth.complete` | ✅ 账号密码登录（`password`） |
-| `auth.submit` | ✅ fixture 直接通过；live 走真实 CAS |
+| `auth.begin` / `auth.submit` / `auth.poll` / `auth.complete` | ✅ 真实 CAS 账号密码登录 |
 | `auth.verify` / `auth.keepalive` | ✅ 基础实现 |
-| `catalog.courses` | ⚠️ fixture 桩课程；live 返回已登录课程占位 |
-| `catalog.units` | ⚠️ fixture 桩单元；live 为空 |
-| `study.step` | ⚠️ fixture 模拟完成；live 返回 `needs_human` |
-| `exam.*` / `activity.step` | ❌ 未实现 |
+| `catalog.courses` | ✅ 配置课程（`course_id` / `course_name`） |
+| `catalog.units` | ✅ 真实课程树，视频 / 阅读叶子 + 进度回读 |
+| `study.step` | ✅ 视频/阅读 `finishNode` + `course_progress` 回读 |
+| `exam.*` / `activity.step` / 章节题目 | ❌ 未实现 |
+| `oral` / 上传 / 讨论 | ❌ 未实现 |
 
 ## 登录模式
 
@@ -29,12 +29,19 @@
 ```json
 {
   "source": "live",
-  "course_id": "<reader token 交换用的 courseId>",
-  "target_url": "https://ucontent.unipus.cn/_ipublishpc_default/pc.html"
+  "course_id": "<reader token / course 用的 courseId>",
+  "course_name": "U校园课程",
+  "book_id": "<教材 bookId>",
+  "book_version": "<bookVersionNumber>",
+  "target_url": "https://ucontent.unipus.cn/_ipublishpc_default/pc.html",
+  "base_url": "https://ipub.unipus.cn",
+  "content_base_url": "https://ucontent.unipus.cn"
 }
 ```
 
-`target_url` 可省略，默认使用上面的地址。`course_id` 缺失时登录会返回明确的失败信息。
+`course_id` 用于登录时的 reader token 交换；`book_id` + `book_version` 用于课程树和章节接口。`course_name` 可省略。
+
+`live` 的课程/单元来自 U校园 课程树：`catalog.units` 会列出 `insert-video` 和 `base-paragraph` / `list` / `collapsible-block` / `rich_text_read` 叶子；`study.step` 用 `finishNode` 完成并回读 `course_progress`。
 
 真实 CAS + token 流程：
 
@@ -101,14 +108,26 @@ live 模式需要宿主设置 `CF_CHROMIUM` 指向 Chrome/Chromium 可执行文�
 - `cw.state round-trip-ok`
 - `cw.session.identity account_raw=unipus-skeleton`
 
+## 构建
+
+```bash
+npm install
+npm run build   # esbuild → index.mjs
+```
+
+`index.mjs` 是打包后的模块入口；源码在 `src/module.ts`，unicheat 的协议代码在 `src/vendor/`。
+
 ## 已知限制
 
-- `live` 的 CAS 登录已实测通过：`code 0`、`serviceTicket`、`openid`、`jwt`，随后在官方页面里成功换到 reader token。
-- **直接**用 Node / `cw.net.fetch` 请求 token 接口会返回 403（openresty）。live 模式已改为 `cw.browser`，不再走这条路径。
-- `study.step` 在 `live` 模式返回 `needs_human`，避免在未验证业务协议的情况下伪造完成。
+- `live` 的 CAS 登录、浏览器内 reader token 已实测通过。
+- 视频/阅读的课程树、`finishNode`、`course_progress` 回读已接入，但**还需要用真实账号做一次验收**。
+- 如果章节接口也被 WAF 403，需要把相关调用迁到 `cw.browser.evaluate`；目前仍走 `cw.net.fetch`。
+- 章节题目、Unit Test、挑战卷、上传、口语尚未实现。
+- 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
 
 ## 下一步
 
-1. 把 unicheat 的 `discover` / `chapter` / `video` / `reading` 迁移为 `catalog.*` / `study.step`。
-2. 题库、检查点改存 `cw.state`；删除文件系统与代理依赖。
-3. 口语 WebSocket 暂不接入，先返回 `needs_human`。
+1. 用真实账号验收 `catalog.units` + 视频/阅读 `study.step`。
+2. 迁移章节题目（解析、LLM、`submitScore`、判分）。
+3. 迁移 Unit Test / 挑战卷到 `exam.*`。
+4. 上传、口语（口语优先走 `cw.browser` 或返回 `needs_human`）。
