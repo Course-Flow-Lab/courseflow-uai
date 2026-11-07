@@ -988,6 +988,31 @@ async function catalogPapers(params: any) {
   };
 }
 
+function examQuestionKind(question: any): string {
+  if (question.type === 'single') return 'single';
+  if (question.type === 'multiple') return 'multiple';
+  if (question.type === 'judge') return 'judge';
+  if (question.type === 'matching') return (question.options?.length ?? 0) > 0 ? 'multiple' : 'blank';
+  if (question.type === 'fill') return 'blank';
+  // short / reading / writing / translation / discussion / speaking / upload / unknown
+  return 'blank';
+}
+
+function examQuestionBlanks(question: any): number {
+  if (question.type === 'single' || question.type === 'multiple' || question.type === 'judge') {
+    return 0;
+  }
+  return Math.max(1, Number(question.blankCount ?? 1));
+}
+
+function examQuestionText(question: any): string {
+  const body = [question.passage, question.stem].filter(Boolean).join('\n\n');
+  if (question.rawType === 'translation') {
+    return `请完成下面的翻译题目，只输出译文：\n${body}`;
+  }
+  return body;
+}
+
 function toExamAttempt(paperData: any) {
   return {
     id: paperData.instanceId,
@@ -996,23 +1021,14 @@ function toExamAttempt(paperData: any) {
     expires_at: null,
     questions: (paperData.questions ?? []).map((question: any) => ({
       id: question.id,
-      kind:
-        question.type === 'single'
-          ? 'single'
-          : question.type === 'multiple'
-            ? 'multiple'
-            : question.type === 'judge'
-              ? 'judge'
-              : question.type === 'fill'
-                ? 'blank'
-                : 'essay',
-      text: question.stem,
+      kind: examQuestionKind(question),
+      text: examQuestionText(question),
       options: (question.options ?? []).map((option: any) => ({
         id: String(option.optionId ?? option.value ?? option.index),
         text: option.text,
       })),
       answer: [],
-      blanks: question.blankCount ?? 0,
+      blanks: examQuestionBlanks(question),
     })),
   };
 }
@@ -1131,6 +1147,13 @@ async function examOpen(params: any) {
     paperData = await createUnitTestInstance(fetcher, auth, cfg, meta);
   }
   if (!paperData.instanceId) throw new Error('试卷实例缺少 instanceId');
+  log(
+    'info',
+    `exam open ${paperData.paperId} ` +
+      (paperData.questions ?? [])
+        .map((question: any) => `${question.rawType}:${question.type}:${question.blankCount}:${question.options?.length ?? 0}`)
+        .join(','),
+  );
 
   await hostCall('cw.state', {
     session,

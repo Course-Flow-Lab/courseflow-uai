@@ -2302,6 +2302,28 @@ async function catalogPapers(params) {
     }))
   };
 }
+function examQuestionKind(question) {
+  if (question.type === "single") return "single";
+  if (question.type === "multiple") return "multiple";
+  if (question.type === "judge") return "judge";
+  if (question.type === "matching") return (question.options?.length ?? 0) > 0 ? "multiple" : "blank";
+  if (question.type === "fill") return "blank";
+  return "blank";
+}
+function examQuestionBlanks(question) {
+  if (question.type === "single" || question.type === "multiple" || question.type === "judge") {
+    return 0;
+  }
+  return Math.max(1, Number(question.blankCount ?? 1));
+}
+function examQuestionText(question) {
+  const body = [question.passage, question.stem].filter(Boolean).join("\n\n");
+  if (question.rawType === "translation") {
+    return `\u8BF7\u5B8C\u6210\u4E0B\u9762\u7684\u7FFB\u8BD1\u9898\u76EE\uFF0C\u53EA\u8F93\u51FA\u8BD1\u6587\uFF1A
+${body}`;
+  }
+  return body;
+}
 function toExamAttempt(paperData) {
   return {
     id: paperData.instanceId,
@@ -2310,14 +2332,14 @@ function toExamAttempt(paperData) {
     expires_at: null,
     questions: (paperData.questions ?? []).map((question) => ({
       id: question.id,
-      kind: question.type === "single" ? "single" : question.type === "multiple" ? "multiple" : question.type === "judge" ? "judge" : question.type === "fill" ? "blank" : "essay",
-      text: question.stem,
+      kind: examQuestionKind(question),
+      text: examQuestionText(question),
       options: (question.options ?? []).map((option) => ({
         id: String(option.optionId ?? option.value ?? option.index),
         text: option.text
       })),
       answer: [],
-      blanks: question.blankCount ?? 0
+      blanks: examQuestionBlanks(question)
     }))
   };
 }
@@ -2430,6 +2452,10 @@ async function examOpen(params) {
     paperData = await createUnitTestInstance(fetcher, auth, cfg, meta);
   }
   if (!paperData.instanceId) throw new Error("\u8BD5\u5377\u5B9E\u4F8B\u7F3A\u5C11 instanceId");
+  log(
+    "info",
+    `exam open ${paperData.paperId} ` + (paperData.questions ?? []).map((question) => `${question.rawType}:${question.type}:${question.blankCount}:${question.options?.length ?? 0}`).join(",")
+  );
   await hostCall("cw.state", {
     session,
     namespace: "exam",

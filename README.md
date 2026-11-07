@@ -121,14 +121,15 @@ npm run build   # esbuild → index.mjs
 
 - `live` 的 CAS 登录、浏览器内 reader token、课程树、视频完成已实测通过。
 - 挑战卷已实测：5 题 → `submitUserPaperAnswer` → `submitUserChallengeScore` → `userScore=5`，平台确认 100 分。
-- Unit Test 可以创建实例并解析 26 题；部分题型（匹配/特殊文本）模型答案无法自动匹配，框架会暂停要求人工补答。
-- Unit Test 的草稿/交卷/回读代码已接入，但**尚未完成一次全自动交卷验收**。
+- Unit Test 已实测全自动交卷：Unit test 1（26 题，单选 + 填空 + 翻译）→ 草稿 200 → 交卷 200 → 回读 status 1，**92.3 分**。
+- Unit Test 会把阅读材料拼进题干；翻译题会附加“只输出译文”的指令；框架侧同时支持选项文本 / 选项 id / A-B-C-D 和判断题同义词。
+- 其他试卷如果出现 matching 或更特殊的题型，仍可能需要人工补答或继续扩展映射。
 - **章节题目和考试都需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
 - 上传、口语、讨论尚未实现。
 - 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
 
 ## 下一步
 
-1. 完善 Unit Test 的题型映射（matching / 特殊文本）并完成一次全自动交卷。
+1. 继续覆盖其他 Unit Test 的 matching / 特殊题型。
 2. 上传、口语、讨论。
 3. 口语优先走 `cw.browser` 或返回 `needs_human`。
