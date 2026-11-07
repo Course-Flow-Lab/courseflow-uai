@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
   "id": "unipus",
-  "name": "U校园（骨架）",
+  "name": "U校园",
   "version": "0.4.1",
   "moduleApi": 1,
   "engines": { "framework": ">=0.1.1 <0.2.0" },
   "runtime": { "engine": "node", "entry": "index.mjs", "files": [] },
   "platform": {
     "id": "unipus",
-    "name": "U校园（骨架）",
+    "name": "U校园",
     "short": "U校园",
     "login": ["password"],
     "operations": ["study", "trial", "answer"],

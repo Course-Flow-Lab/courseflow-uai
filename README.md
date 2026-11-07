@@ -1,158 +1,171 @@
-# Courseflow U校园模块（courseflow-uai）
+# courseflow-uai
 
-这是 Courseflow 的 U校园平台模块，项目名 `courseflow-uai`。**真实 CAS 账号密码登录已经打通**（含浏览器内 reader token 交换）；课程目录、视频/阅读、章节题、上传、口语、挑战卷和 Unit Test 已接入。
+Courseflow 的 U校园（Unipus）平台模块，提供课程目录、学习任务、章节题目、多媒体上传、口语和试卷的协议实现。
 
-## 当前实现
+项目名是 `courseflow-uai`，模块 ID 仍然是 `unipus`；在 Courseflow 里看到的平台名称是「U校园」。
 
-| 方法 | 状态 |
-|---|---|
-| `platform.describe` | ✅ 与清单一致 |
-| `auth.begin` / `auth.submit` / `auth.poll` / `auth.complete` | ✅ 真实 CAS 账号密码登录 |
-| `auth.verify` / `auth.keepalive` | ✅ 基础实现 |
-| `catalog.courses` | ✅ 配置课程（`course_id` / `course_name`） |
-| `catalog.units` | ✅ 真实课程树：视频 / 阅读 / 题目活动 / 多媒体上传，带进度回读 |
-| `study.step` | ✅ 视频/阅读 `finishNode`；客观题 `submitScore`；主观题 `judgeStart`/`judgeResult`/`submitScore`；上传 COS + `submitScore`；口语 TTS + SOE + COS + `submitScore` |
-| `catalog.papers` | ✅ 8 个挑战卷 + 8 个 Unit Test（从课程树/章节结构提取） |
-| `exam.*` | ✅ 挑战卷 create → 提交 → 分数确认；Unit Test create / 草稿 / 交卷 / 回读 |
+> 请只在你有权访问的账号和课程上使用。运行前确认符合平台条款和学校规定。
 
-## 登录模式
+## 功能
 
-模块设置（`CF_MODULE_SETTINGS`）里的 `source`：
+- CAS 账号密码登录，reader token 通过官方页面交换
+- 课程树、单元进度回读
+- 视频和阅读节点完成
+- 章节题目：单选、多选、判断、填空、连线，以及 AI 评分的主观题
+- 多媒体上传：COS 凭证、文件上传、`submitScore`
+- 口语任务：TTS、SOE 评测、音频上传、回读平台评测
+- 挑战卷和 Unit Test：创建实例、草稿、交卷、分数回读
+- 客观题答案回填：低于 100 分时用平台答案重交
+- 提交护栏：答案去重、请求限速、408/429/5xx 重试
 
-| 值 | 行为 |
-|---|---|
-| `fixture`（默认） | 任意账号密码都直接 `connected`，用于离线验证框架 |
-| `live` | 真实 CAS 登录 + 浏览器内 reader token 交换 |
+## 环境
 
-`live` 需要额外的模块设置：
-
-```json
-{
-  "source": "live",
-  "course_id": "<reader token / course 用的 courseId>",
-  "course_name": "U校园课程",
-  "book_id": "<教材 bookId>",
-  "book_version": "<bookVersionNumber>",
-  "target_url": "https://ucontent.unipus.cn/_ipublishpc_default/pc.html",
-  "base_url": "https://ipub.unipus.cn",
-  "content_base_url": "https://ucontent.unipus.cn"
-}
-```
-
-`course_id` 用于登录时的 reader token 交换；`book_id` + `book_version` 用于课程树和章节接口。`course_name` 可省略。
-
-`live` 的课程/单元来自 U校园 课程树：`catalog.units` 会列出 `insert-video` 和 `base-paragraph` / `list` / `collapsible-block` / `rich_text_read` 叶子；`study.step` 用 `finishNode` 完成并回读 `course_progress`。
-
-真实 CAS + token 流程：
-
-```text
-GET  sso.unipus.cn/sso/login?service=...
-POST sso.unipus.cn/sso/0.1/sso/cip/login   (AES-128-CBC)
-GET  ucontent.unipus.cn:443/cas-auth/login/?next=...   (Set-Cookie: jwt)
-
-cw.browser.open(TARGET)                    ← 宿主把 CAS Cookie 注入官方页面
-cw.browser.evaluate(fetch('/course/api/v3/ipublish/token',
-  { credentials: 'include', body: { courseId, readerType: 2 } }))
-  → 200 + data.token
-```
-
-> 直接用 Node / `cw.net.fetch` 请求 token 接口会被 openresty 返回 403（请求指纹被 WAF 拦），
-> 所以 live 模式改用 `cw.browser` 在官方页面里请求。需要清单 `browser: true` 和宿主的 `CF_CHROMIUM`。
-
-凭据只用于登录交换，不写入 `cw.state`。reader token 和 openId 存在 `cw.state` 的 `auth/session`。
-
-## 宿主服务冒烟
-
-`catalog.courses` 会依次验证：
-
-1. `cw.net.fetch` 访问 `https://sso.unipus.cn/sso/login?...`（白名单内）
-2. `cw.net.fetch` 访问 `https://example.com/`（应返回 `net_blocked`）
-3. `cw.state` 写入并读回一条记录
-4. `cw.session.identity` 读取身份
-
-结果写入 stderr 日志，并通过 `cw.log` 通知宿主。
-
-## 清单
-
-- `id` / `platform.id`：`unipus`
-- `runtime.engine`：`node`，入口 `index.mjs`
-- `login`：`password`（网页显示账号密码表单）
-- `operations`：`study`、`trial`
-- `unit_kinds`：`video`、`reading`、`document`
-- 网络许可：`unipus.cn`、`*.unipus.cn`、`*.myqcloud.com`
-- `browser`：`true`（live reader token）
-- `ai`：`false`
+- Node.js 24 或更高
+- Courseflow Framework `>=0.1.1 <0.2.0`
+- Chrome / Chromium，用于 live 登录、口语和连线题兜底
 
 ## 安装
 
-先准备框架（Node ≥ 24），然后：
+```bash
+git clone https://github.com/Course-Flow-Lab/courseflow-uai.git
+cd courseflow-uai
+npm install
+npm run build
+```
+
+把模块加入 Courseflow：
 
 ```bash
-cd courseflow-framework
+cd ../courseflow-framework
 npm run cli -- module add /path/to/courseflow-uai
 npm run cli -- module list
 ```
 
-启动服务后，在网页「平台连接」里连接 `unipus`，输入 U校园 账号密码。
-live 模式需要宿主设置 `CF_CHROMIUM` 指向 Chrome/Chromium 可执行文件。
+启动服务：
 
-## 验证
+```bash
+npm run serve
+```
 
-可以复用 `cf-demo.sh` 的 API 流程，把平台 id 从 `sim` 换成 `unipus`，课程 id 用 `unipus-demo` / `unipus-demo-class`，单元 id 用 `unipus-demo-u1`。
+## 配置
 
-重点看：
+在 Courseflow 的模块设置里使用 `live` 模式：
 
-- 服务端 stderr 的 `[unipus]` 日志
-- `cw.net.fetch allowed status=200`
-- `cw.net.fetch blocked as expected: net_blocked`
-- `cw.state round-trip-ok`
-- `cw.session.identity account_raw=unipus-skeleton`
+```json
+{
+  "source": "live",
+  "course_id": "<courseId>",
+  "course_name": "U校园课程",
+  "book_id": "<bookId>",
+  "book_version": "<bookVersionNumber>",
+  "target_url": "https://ucontent.unipus.cn/_ipublishpc_default/pc.html"
+}
+```
+
+`course_id` 用于 reader token 交换，`book_id` 和 `book_version` 用于课程树与章节接口。
+
+可选配置：
+
+- `base_url`：默认 `https://ipub.unipus.cn`
+- `content_base_url`：默认 `https://ucontent.unipus.cn`
+- `browser_fallback`：设为 `false` 可关闭连线题浏览器兜底
+
+宿主环境变量：
+
+```bash
+CF_CHROMIUM=/path/to/chrome
+CF_HTTP_PROXY=http://127.0.0.1:7890
+```
+
+代理是全局的，模块请求和官方 Chromium 都会使用它。
+
+## 使用
+
+1. 在 Courseflow 里连接 `unipus`，输入账号密码。
+2. 在「模型与任务设置」里选择一个模型。章节题和考试需要模型，未配置时任务会暂停。
+3. 在「学习目录」里选择单元执行学习任务。
+4. 在「作业与考试」里选择挑战卷或 Unit Test。
+5. 口语任务需要本机 Chromium；每个 step 处理一题，避免超过 30 秒调用上限。
+
+## 工作方式
+
+模块运行在 Courseflow 的模块宿主里，通过 JSON-RPC 调用宿主提供的能力：
+
+- `cw.net.fetch`：访问 U校园接口，处理 Cookie、授权和网络白名单
+- `cw.browser`：打开官方页面，交换 reader token、建立 SOE WebSocket、拖拽 React Flow 连线
+- `cw.ai.generate`：章节题和口语答案生成
+- `cw.state`：保存 token、答案缓存、提交 ledger 和活动状态
+- `cw.log`：写入宿主日志
+
+登录时先通过 CAS 获取 `jwt` Cookie，再在官方页面里请求 reader token。之后的课程、章节、答案和试卷接口都走 `cw.net.fetch`。
+
+## 项目结构
+
+```text
+src/module.ts            模块入口和方法实现
+src/vendor/              从协议实现中拆出的接口代码
+courseflow.module.json   模块清单
+index.mjs                esbuild 打包产物
+```
 
 ## 构建
 
 ```bash
 npm install
-npm run build   # esbuild → index.mjs
+npm run build
 ```
 
-`index.mjs` 是打包后的模块入口；源码在 `src/module.ts`，unicheat 的协议代码在 `src/vendor/`。
+`index.mjs` 由 `src/module.ts` 打包生成，不要直接修改。
+
+## 测试情况
+
+开发时在真实课程上验证过以下流程：
+
+- CAS 登录、课程树、视频和阅读完成
+- 章节单选、填空、判断和主观题评分
+- 多媒体上传：COS PUT 200，`submitScore` 200
+- 挑战卷：5 题，平台确认 100 分
+- Unit Test 1：26 题，自动交卷，回读 92.3 分
+- 口语：SOE 评测 81 分，音频上传和提交成功
+
+这些是开发环境的样本结果，不同课程、试卷和模型可能得到不同分数。
+
+## 行为说明
+
+- 自动评分的客观题必须达到 100 分才算通过。低于 100 时会读取平台答案并重交一次；仍达不到会暂停并提示人工检查。
+- 平台只存储、不评分的长文本填空题（`status: 0`、`score: null`）按已作答处理，避免永远卡在 0 分。
+- 主观题只要平台已保存答案就算通过，不强制 100 分。
+- Unit Test 会续答未完成的实例；挑战卷始终新建实例。
+- 已满分的题组会跳过，不重复调用模型，也不重复提交。
+- 某个题组确认无法自动达到 100 分时会写入 `blocked`，后续任务直接暂停，不会反复重交。
+- 北京时间 23:00–07:00 框架会暂停写操作。本地测试可以设置 `CF_QUIET_HOURS_DISABLED_UNTIL` 临时关闭。
 
 ## 已知限制
 
-- `live` 的 CAS 登录、浏览器内 reader token、课程树、视频完成已实测通过。
-- 挑战卷已实测：5 题 → `submitUserPaperAnswer` → `submitUserChallengeScore` → `userScore=5`，平台确认 100 分。
-- Unit Test 已实测全自动交卷：Unit test 1（26 题，单选 + 填空 + 翻译）→ 草稿 200 → 交卷 200 → 回读 status 1，**92.3 分**。
-- Unit Test 会把阅读材料拼进题干；翻译题会附加“只输出译文”的指令；框架侧同时支持选项文本 / 选项 id / A-B-C-D 和判断题同义词。
-- Unit Test 1–8 题型完全一致：**21 × single_choice + 4 × fill_blanks_choice + 1 × translation**，共 26 题。
-- 8 个 Unit Test 中**没有 matching、writing、short_answer、discussion、upload、speaking** 等特殊题型。
-- `matching`（`text_match` / 连线）只出现在章节活动里，Unit Test 里没有；当前模块的章节题目链路已能处理 `text_match` 的选项编码。
-- **章节客观题按 100 分判定通过**：提交后回读 `answer/list`，未到 100 分时用平台标准答案自动重交一次；仍不到 100 会暂停并提示人工检查。
-- 平台只存储但不评分的长文本填空题（`status: 0`、`score: null`）按“已作答”通过，否则会永远卡在 0 分；能自动评分的单选/判断/选词/连线/普通填空必须到 100。
-- 已满分（100）的题组会跳过，不重复调用模型、不重复提交。
-- 提交护栏：按“题组 + 版本 + 答案”做 ledger 去重；两次提交至少间隔 2.5 秒、每分钟最多 20 次；408/429/5xx 自动退避重试。
-- 某个题组确认无法自动到 100 时会记入 `blocked`，后续任务直接暂停提示，不会反复重交。
-- 连线题协议提交仍不完整时，会尝试打开官方章节页，用 CDP 真实鼠标拖拽 React Flow 节点作为兜底；失败才转人工。
-- Unit Test / 挑战卷交卷遇到 417 风控时会明确提示“草稿已保存，请到官方页面手动交卷”。
-- 框架支持 `CF_HTTP_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`，模块的 HTTP 请求和官方 Chromium 都会走该代理。
-- 题目活动完成后会写入模块状态，`catalog.units` 里的 `q::` 活动会显示 `completed`，后续 job 不再重做。
-- 试卷会先查最新实例：**只有 Unit Test 续答**；挑战卷始终新建实例，避免复用过期挑战卷。已交卷的试卷会跳过；`exam.redo` 才会新建 Unit Test 实例。
-- 试卷状态读取失败时，目录会把该试卷标记为不可用并给出原因，不会误判为“未交卷”而重复开卷。
-- 章节答案按 8 题一批求解；模型返回非法 JSON 会自动重试一次。
-- 主观题只要平台已保存答案就算通过（不强制 100）；自动评分客观题仍要求 100。
-- **章节题目和考试都需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
-- 上传已实测：Unit 7 多媒体上传 → COS PUT 200 → `submitScore` 200 → `unit_completed`。
-- 口语已实测：AI 生成 30–45 词答案 → 百度 TTS → 浏览器内转 16 kHz WAV → SOE WebSocket 评测（81 分）→ COS 上传 → 回读平台评测 → `submitScore` 200。
-- 口语每个 step 只处理一题（TTS + SOE + 上传约 20 秒），避免触发框架 30 秒单次调用上限；已作答的题组会自动跳过。
-- 口语依赖本机 Chromium（`CF_CHROMIUM`）和浏览器内 WebSocket；模块本身不直接开 socket。
-- TTS 使用 `fanyi.baidu.com/gettts`（已在模块网络权限中）；如果该接口失效，口语会暂停并提示语音合成失败。
-- 口语 TTS 会把生成的答案文本发送到百度语音接口，不会发送账号信息；如需完全离线，需要替换 TTS 源。
-- 讨论尚未实现。
-- 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
+- 讨论题尚未作答，平台返回 0 分时可能被当作已完成。
+- 连线题以协议编码为主。协议未完成时会尝试在官方页面拖拽 React Flow，失败后转人工；这条兜底路径还没有在未完成的连线上完整验证。
+- 当前 8 个 Unit Test 没有 matching 题型。如果以后出现，matching 的试卷编码还没有验证。
+- 上传默认生成一个示例 PDF，还没有“指定真实作业文件”的模块设置。
+- 口语 TTS 使用 `fanyi.baidu.com/gettts`，答案文本会发送到百度语音接口；需要完全离线时需替换 TTS 源。
+- 未实现 token 自动续期、共享答案库、逐题考试复盘和口语低分重试。
+- 代理只有全局配置，没有按账号设置。
+- Unit Test 或挑战卷交卷遇到 417 风控时，需要到官方页面手动点击交卷。
 
-## 下一步
+## 安全与隐私
 
-1. Token 自动续期（剩余不足 6 小时自动重新登录）。
-2. 共享答案库（跨账号/跨部署 import/export/pull/push）。
-3. 考试回读 `graded_answers` / `review`，支持逐题正确答案复盘。
-4. 上传真实文件（模块设置里的文件路径）。
-5. 口语低分重试（`improve`）。
+- 账号密码只用于登录交换，不写入模块状态。
+- reader token 和 openId 保存在模块的 `cw.state` 中。
+- 仓库不包含账号、Cookie、token 或课程 ID。
+- 口语 TTS 会把生成的答案文本发送到百度语音接口，不会发送账号信息。
+
+## 贡献
+
+欢迎提交 issue 和 pull request。提交前请先运行：
+
+```bash
+npm run build
+```
+
+## License
+
+MIT
