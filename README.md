@@ -129,6 +129,10 @@ npm run build   # esbuild → index.mjs
 - **章节客观题按 100 分判定通过**：提交后回读 `answer/list`，未到 100 分时用平台标准答案自动重交一次；仍不到 100 会暂停并提示人工检查。
 - 平台只存储但不评分的长文本填空题（`status: 0`、`score: null`）按“已作答”通过，否则会永远卡在 0 分；能自动评分的单选/判断/选词/连线/普通填空必须到 100。
 - 已满分（100）的题组会跳过，不重复调用模型、不重复提交。
+- 提交护栏：按“题组 + 版本 + 答案”做 ledger 去重；两次提交至少间隔 2.5 秒、每分钟最多 20 次；408/429/5xx 自动退避重试。
+- 某个题组确认无法自动到 100 时会记入 `blocked`，后续任务直接暂停提示，不会反复重交。
+- 连线题协议提交仍不完整时，会尝试打开官方章节页，用 CDP 真实鼠标拖拽 React Flow 节点作为兜底；失败才转人工。
+- 框架支持 `CF_HTTP_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`，模块的 HTTP 请求和官方 Chromium 都会走该代理。
 - 题目活动完成后会写入模块状态，`catalog.units` 里的 `q::` 活动会显示 `completed`，后续 job 不再重做。
 - 试卷会先查最新实例：未交卷的续答，已交卷的跳过；`exam.redo` 才会新建实例。
 - `catalog.papers` 会回读 `done` / `score`，Unit Test 和挑战卷都能显示实际状态。
@@ -144,8 +148,8 @@ npm run build   # esbuild → index.mjs
 
 ## 下一步
 
-1. 提交去重 ledger、客户端限速和 408/429/5xx 自动重试。
-2. Token 自动续期（剩余不足 6 小时自动重新登录）。
-3. 共享答案库（跨账号/跨部署 import/export/pull/push）。
-4. 考试回读 `graded_answers` / `review`，支持逐题正确答案复盘。
-5. 讨论题和口语低分重试（`improve`）。
+1. Token 自动续期（剩余不足 6 小时自动重新登录）。
+2. 共享答案库（跨账号/跨部署 import/export/pull/push）。
+3. 考试回读 `graded_answers` / `review`，支持逐题正确答案复盘。
+4. 上传真实文件（模块设置里的文件路径）。
+5. 口语低分重试（`improve`）。

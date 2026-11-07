@@ -15,7 +15,7 @@
  *
  * 尚未实现：真实课程目录、章节/视频/阅读协议、考试。live 模式下 study.step 返回 needs_human。
  */
-import { createCipheriv, createHmac } from 'node:crypto';
+import { createCipheriv, createHash, createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import {
@@ -38,6 +38,7 @@ import {
   buildPaperSavePayload,
   buildPaperSubmitPayload,
 } from './vendor/paper-api.js';
+import { matchOption } from './vendor/matcher.js';
 import { lexicalText, parsePaperData } from './vendor/paper.js';
 import {
   collectQuizLinks,
@@ -823,11 +824,16 @@ async function readGroupState(
       complete: false,
     };
   }
-  const result = await fetchChapterAnswerList(
-    { token: auth.token, baseUrl: IPUB_BASE },
-    groupId,
-    version,
-    fetcher,
+  const result = await withRetry(
+    () =>
+      fetchChapterAnswerList(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        groupId,
+        version,
+        fetcher,
+      ),
+    3,
+    700,
   );
   const data = result.data ?? {};
   const children = Array.isArray(data.userAnswersResult) ? data.userAnswersResult : [];
@@ -923,6 +929,152 @@ async function saveActivityState(session: string, key: string, value: any): Prom
   } catch {
     // state is an optimization; never fail the step for it
   }
+}
+
+// ---------------------------------------------------------------- submission guard
+
+function submissionKey(submission: any): string {
+  const answers = (submission.userAnswers ?? [])
+    .map((record: any) => `${record.childId}\u0001${record.userAnswerValue}`)
+    .sort()
+    .join('\u0002');
+  return createHash('sha256')
+    .update(
+      [
+        submission.groupId,
+        submission.versionNumber,
+        submission.mode,
+        answers,
+      ].join('\u0003'),
+      'utf8',
+    )
+    .digest('hex');
+}
+
+const submissionLedgerCache = new Map<
+  string,
+  { at: number; value: { entries: Record<string, any>; blocked: Record<string, any> } }
+>();
+
+async function readSubmissionLedger(
+  session: string,
+  bookId: string,
+): Promise<{ entries: Record<string, any>; blocked: Record<string, any> }> {
+  const cacheKey = `${session}:${bookId}`;
+  const cached = submissionLedgerCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < 5_000) return cached.value;
+  let value: { entries: Record<string, any>; blocked: Record<string, any> } = {
+    entries: {},
+    blocked: {},
+  };
+  try {
+    const stored: any = await hostCall('cw.state', {
+      session,
+      namespace: 'submissions',
+      key: bookId,
+    });
+    const raw = stored?.value;
+    if (raw && typeof raw === 'object') {
+      value = {
+        entries: raw.entries && typeof raw.entries === 'object' ? raw.entries : {},
+        blocked: raw.blocked && typeof raw.blocked === 'object' ? raw.blocked : {},
+      };
+    }
+  } catch {
+    // fall back to an empty ledger
+  }
+  submissionLedgerCache.set(cacheKey, { at: Date.now(), value });
+  return value;
+}
+
+async function saveSubmissionLedger(
+  session: string,
+  bookId: string,
+  value: { entries: Record<string, any>; blocked: Record<string, any> },
+): Promise<void> {
+  submissionLedgerCache.set(`${session}:${bookId}`, { at: Date.now(), value });
+  try {
+    await hostCall('cw.state', {
+      session,
+      namespace: 'submissions',
+      key: bookId,
+      value,
+    });
+  } catch {
+    // ledger is best-effort
+  }
+}
+
+async function recordSubmission(
+  session: string,
+  bookId: string,
+  entry: Record<string, any>,
+): Promise<void> {
+  const ledger = await readSubmissionLedger(session, bookId);
+  ledger.entries[entry.key] = entry;
+  await saveSubmissionLedger(session, bookId, ledger);
+}
+
+async function blockGroup(
+  session: string,
+  bookId: string,
+  groupId: string,
+  reason: string,
+): Promise<void> {
+  const ledger = await readSubmissionLedger(session, bookId);
+  ledger.blocked[groupId] = { reason, at: Date.now() };
+  await saveSubmissionLedger(session, bookId, ledger);
+}
+
+const submitThrottle = new Map<string, number[]>();
+
+/** Keep two writes >=2.5s apart and at most 20 per rolling minute. */
+async function waitForSubmitSlot(session: string): Promise<void> {
+  const now = Date.now();
+  const times = (submitThrottle.get(session) ?? []).filter(
+    (stamp) => now - stamp < 60_000,
+  );
+  let wait = 0;
+  if (times.length >= 20) {
+    wait = Math.max(wait, 60_000 - (now - times[0]!));
+  }
+  const last = times[times.length - 1];
+  if (last !== undefined) wait = Math.max(wait, last + 2_500 - now);
+  if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  times.push(Date.now());
+  submitThrottle.set(session, times);
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+async function withRetry<T>(
+  run: (attempt: number) => Promise<T>,
+  attempts = 3,
+  baseDelayMs = 800,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const value = await run(attempt);
+      const status = Number((value as any)?.status ?? 0);
+      if (isRetryableStatus(status) && attempt < attempts) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)),
+        );
+        continue;
+      }
+      return value;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      await new Promise((resolve) =>
+        setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)),
+      );
+    }
+  }
+  throw lastError ?? new Error('retry failed');
 }
 
 async function solveQuestions(session: string, activity: any): Promise<any[]> {
@@ -1229,24 +1381,30 @@ async function runOralQuestion(
     uploaded.url,
     clio.tokenId,
   );
-  const response = await submitChapterScore(
-    { token: auth.token, baseUrl: IPUB_BASE },
-    meta,
-    {
-      groupId: String(question.groupId ?? ''),
-      versionNumber: String(question.groupVersion ?? ''),
-      mode: 'score',
-      userAnswers: [
+  await waitForSubmitSlot(session);
+  const response = await withRetry(
+    () =>
+      submitChapterScore(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        meta,
         {
-          questionId: String(question.id),
-          childId,
-          questionType: 'oral_personal_state',
-          userAnswerValue: value,
-          bizAnswerId: clio.tokenId,
+          groupId: String(question.groupId ?? ''),
+          versionNumber: String(question.groupVersion ?? ''),
+          mode: 'score',
+          userAnswers: [
+            {
+              questionId: String(question.id),
+              childId,
+              questionType: 'oral_personal_state',
+              userAnswerValue: value,
+              bizAnswerId: clio.tokenId,
+            },
+          ],
         },
-      ],
-    },
-    fetcher,
+        fetcher,
+      ),
+    3,
+    900,
   );
   log(
     'info',
@@ -1255,8 +1413,138 @@ async function runOralQuestion(
   if (!response.ok) throw new Error(`口语 submitScore failed: HTTP ${response.status}`);
 }
 
-async function uploadSampleFile(fetcher: any, auth: any): Promise<any> {
-  const fileName = `unicheat-upload-${Date.now()}.pdf`;
+function isMatchingQuestion(question: any): boolean {
+  const type = String(question?.rawType ?? question?.type ?? '');
+  return type === 'text_match' || type === 'matching';
+}
+
+function matchingEdges(question: any, answers: any[]): Array<{ from: string; to: string }> {
+  const answer = answers.find(
+    (item) => String(item.questionId ?? '') === String(question.id ?? ''),
+  );
+  const pairs = Array.isArray(question.pairs) ? question.pairs : [];
+  const options = Array.isArray(question.options) ? question.options : [];
+  const edges: Array<{ from: string; to: string }> = [];
+  for (let index = 0; index < pairs.length; index += 1) {
+    const text = answer?.texts?.[index];
+    if (!text) continue;
+    const match = matchOption(String(text), options);
+    const to = match?.option?.optionId ?? match?.option?.value;
+    const from = pairs[index]?.id;
+    if (from && to) edges.push({ from: String(from), to: String(to) });
+  }
+  return edges;
+}
+
+/**
+ * DOM fallback for matching questions when the protocol pair encoding cannot
+ * reach 100. React Flow only accepts real pointer input, so the framework's
+ * `cw.browser.mouse` (CDP Input.dispatchMouseEvent) drives the drags.
+ */
+async function runMatchingFallback(
+  session: string,
+  meta: any,
+  question: any,
+  answers: any[],
+): Promise<boolean> {
+  const edges = matchingEdges(question, answers);
+  if (edges.length === 0) return false;
+  const first = edges[0]!.from;
+  const source = `(() => {
+    const first = ${JSON.stringify(first)};
+    const edges = ${JSON.stringify(edges)};
+    const docs = [];
+    const collect = (doc) => {
+      docs.push(doc);
+      for (const frame of doc.querySelectorAll('iframe')) {
+        try { if (frame.contentDocument) collect(frame.contentDocument); } catch {}
+      }
+    };
+    collect(document);
+    let doc = null;
+    let block = null;
+    for (const candidate of docs) {
+      const node = candidate.querySelector('.react-flow__node[data-id="' + first + '"]');
+      if (!node) continue;
+      doc = candidate;
+      block = node.closest('.editor-question-block') || node.closest('[data-question-id]') || node.parentElement;
+      break;
+    }
+    if (!block || !doc) return { ok: false, error: 'matching block not found' };
+    const offset = () => {
+      let x = 0;
+      let y = 0;
+      let win = doc.defaultView;
+      while (win && win.frameElement) {
+        const rect = win.frameElement.getBoundingClientRect();
+        x += rect.left;
+        y += rect.top;
+        win = win.parent;
+      }
+      return { x, y };
+    };
+    block.scrollIntoView({ block: 'center', inline: 'center' });
+    const off = offset();
+    const center = (el) => {
+      const rect = el.getBoundingClientRect();
+      return { x: off.x + rect.left + rect.width / 2, y: off.y + rect.top + rect.height / 2 };
+    };
+    const out = [];
+    for (const edge of edges) {
+      const existing = block.querySelector('.react-flow__edge[data-testid="rf__edge-e' + edge.from + '-' + edge.to + '"]');
+      if (existing) { out.push({ ...edge, skip: true }); continue; }
+      const from = block.querySelector('.react-flow__node[data-id="' + edge.from + '"] .react-flow__handle.source');
+      const to = block.querySelector('.react-flow__node[data-id="' + edge.to + '"] .react-flow__handle.target');
+      if (!from || !to) { out.push({ ...edge, error: 'handle not found' }); continue; }
+      out.push({ ...edge, from: center(from), to: center(to) });
+    }
+    return { ok: true, edges: out };
+  })()`;
+  const clickSave = `(() => {
+    const docs = [];
+    const collect = (doc) => {
+      docs.push(doc);
+      for (const frame of doc.querySelectorAll('iframe')) {
+        try { if (frame.contentDocument) collect(frame.contentDocument); } catch {}
+      }
+    };
+    collect(document);
+    for (const doc of docs) {
+      const button = doc.querySelector("[data-ipublish-event-type='question-submit'], .save-btn, button[data-action='save']");
+      if (button) { button.click(); return { ok: true }; }
+    }
+    return { ok: false };
+  })()`;
+
+  const page = await openOfficialPage(session, meta.referer);
+  try {
+    const coords: any = await evaluateOnPage(session, page, source);
+    if (!coords?.ok) {
+      log('warn', `matching fallback: ${coords?.error ?? 'block not found'}`);
+      return false;
+    }
+    for (const edge of coords.edges ?? []) {
+      if (edge.skip || edge.error || !edge.from || !edge.to) continue;
+      await hostCall('cw.browser.mouse', {
+        session,
+        page,
+        stage: 'save_study',
+        action: { type: 'drag', from: edge.from, to: edge.to, steps: 14 },
+      });
+    }
+    const saved: any = await evaluateOnPage(session, page, clickSave);
+    if (!saved?.ok) log('warn', 'matching fallback: save button not found');
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    return true;
+  } catch (error) {
+    log('warn', `matching fallback failed: ${errorText(error)}`);
+    return false;
+  } finally {
+    await hostCall('cw.browser.close', { session, page }).catch(() => {});
+  }
+}
+
+async function uploadSampleFile(fetcher: any, auth: any): Promise<any> {  const fileName = `unicheat-upload-${Date.now()}.pdf`;
   return uploadAnswerFile(
     { token: auth.token, baseUrl: IPUB_BASE },
     {
@@ -1313,6 +1601,7 @@ async function studyQuestionStep(
       chapterId,
     }),
   };
+  const submissionLedger = await readSubmissionLedger(session, cfg.bookId);
 
   const groupVersionOf = (group: any): string =>
     String(
@@ -1356,6 +1645,16 @@ async function studyQuestionStep(
     );
   }
   const observedStates = new Map(preStates);
+  let clearedBlocks = false;
+  for (const [groupId, state] of preStates) {
+    if (state.complete && submissionLedger.blocked[groupId]) {
+      delete submissionLedger.blocked[groupId];
+      clearedBlocks = true;
+    }
+  }
+  if (clearedBlocks) {
+    await saveSubmissionLedger(session, cfg.bookId, submissionLedger);
+  }
 
   if (params.checkpoint?.phase !== 'submitted' && allComplete([...preStates.values()])) {
     const scores = [...preStates.values()].map((state) => state.score ?? null);
@@ -1408,6 +1707,13 @@ async function studyQuestionStep(
     if (pendingGroups.length > 0) {
       const group = pendingGroups[0];
       const groupId = String(group.groupId);
+      const blocked = submissionLedger.blocked[groupId];
+      if (blocked) {
+        return {
+          status: 'needs_human',
+          reason: `题组 ${groupId} 已暂停：${blocked.reason ?? '需要人工处理'}`,
+        };
+      }
       const pendingQuestions = questionsOfGroup(groupId);
       let answers = await readCachedAnswers(session, rawId);
       if (!answers) {
@@ -1430,13 +1736,32 @@ async function studyQuestionStep(
 
       const submission = submissions[0];
       const questions = pendingQuestions;
+      const key = submissionKey(submission);
+      const previous = submissionLedger.entries[key];
+      if (previous?.pendingManual) {
+        return {
+          status: 'needs_human',
+          reason: `题组 ${groupId} 已提交过且需要人工评分：${previous.reason ?? 'pending manual'}`,
+        };
+      }
+      let finalSubmission = submission;
       if (submission.mode === 'judge') {
-        const outcome = await submitChapterJudge(
+        await waitForSubmitSlot(session);
+        let outcome = await submitChapterJudge(
           { token: auth.token, baseUrl: IPUB_BASE },
           meta,
           submission,
           { fetcher, maxAttempts: 8, pollIntervalMs: 1200 },
         );
+        if (isRetryableStatus(Number(outcome.responses.start?.status ?? 0))) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          outcome = await submitChapterJudge(
+            { token: auth.token, baseUrl: IPUB_BASE },
+            meta,
+            submission,
+            { fetcher, maxAttempts: 8, pollIntervalMs: 1200 },
+          );
+        }
         log(
           'info',
           `judge ${groupId} polls=${outcome.polls} score=${outcome.score ?? 'pending'}` +
@@ -1450,11 +1775,17 @@ async function studyQuestionStep(
           await readGroupState(auth, fetcher, groupId, submission.versionNumber, questions),
         );
       } else {
-        const result = await submitChapterScore(
-          { token: auth.token, baseUrl: IPUB_BASE },
-          meta,
-          submission,
-          fetcher,
+        await waitForSubmitSlot(session);
+        const result = await withRetry(
+          () =>
+            submitChapterScore(
+              { token: auth.token, baseUrl: IPUB_BASE },
+              meta,
+              submission,
+              fetcher,
+            ),
+          3,
+          900,
         );
         log(
           'info',
@@ -1480,6 +1811,7 @@ async function studyQuestionStep(
             const corrected = applyPlatformAnswers(submission, state);
             if (corrected) effective = corrected;
           }
+          finalSubmission = { ...effective, mode: 'judge' };
           log('info', `escalate ${groupId}: ungraded, retrying via judgeStart`);
           const outcome = await submitChapterJudge(
             { token: auth.token, baseUrl: IPUB_BASE },
@@ -1511,12 +1843,19 @@ async function studyQuestionStep(
             log('warn', `correct ${groupId}: platform key could not be applied`);
           } else {
             effective = corrected;
+            finalSubmission = corrected;
             await new Promise((resolve) => setTimeout(resolve, 500));
-            const correctedResult = await submitChapterScore(
-              { token: auth.token, baseUrl: IPUB_BASE },
-              meta,
-              corrected,
-              fetcher,
+            await waitForSubmitSlot(session);
+            const correctedResult = await withRetry(
+              () =>
+                submitChapterScore(
+                  { token: auth.token, baseUrl: IPUB_BASE },
+                  meta,
+                  corrected,
+                  fetcher,
+                ),
+              3,
+              900,
             );
             log(
               'info',
@@ -1539,13 +1878,59 @@ async function studyQuestionStep(
         }
       }
 
-      const post = observedStates.get(groupId);
+      let post = observedStates.get(groupId);
+      if (!post?.complete) {
+        const matching = questions.filter(isMatchingQuestion);
+        if (matching.length > 0 && SETTINGS.browser_fallback !== false) {
+          log('info', `matching ${groupId}: protocol incomplete, trying DOM drag fallback`);
+          const attempted = await runMatchingFallback(
+            session,
+            meta,
+            matching[0],
+            answers,
+          );
+          if (attempted) {
+            post = await readGroupState(
+              auth,
+              fetcher,
+              groupId,
+              submission.versionNumber,
+              questions,
+            );
+            observedStates.set(groupId, post);
+            log('info', `matching fallback ${groupId} score=${post.score ?? '?'}`);
+          }
+        }
+      }
       if (!post?.complete) {
         const reason = post?.objective
           ? `题组 ${groupId} 客观题未达到 100 分（当前 ${post?.score ?? '无分数'}）`
           : `题组 ${groupId} 尚未完成（平台未返回成绩）`;
+        await recordSubmission(session, cfg.bookId, {
+          key: submissionKey(finalSubmission),
+          groupId,
+          versionNumber: finalSubmission.versionNumber,
+          mode: finalSubmission.mode,
+          submittedAt: new Date().toISOString(),
+          status: 200,
+          score: post?.score ?? null,
+          reason,
+          pendingManual: true,
+        });
+        await blockGroup(session, cfg.bookId, groupId, reason);
         return { status: 'needs_human', reason };
       }
+
+      await recordSubmission(session, cfg.bookId, {
+        key: submissionKey(finalSubmission),
+        groupId,
+        versionNumber: finalSubmission.versionNumber,
+        mode: finalSubmission.mode,
+        submittedAt: new Date().toISOString(),
+        status: 200,
+        score: post.score ?? null,
+        pendingManual: false,
+      });
 
       const doneGroups = groups.filter(
         (item: any) => observedStates.get(String(item.groupId))?.complete,
@@ -2552,43 +2937,64 @@ async function studyStep(params) {
         `finishNode text ${anchor} type ${base} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
       );
     } else if (isUploadGroup(base)) {
-      const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
-      const spec = findUploadSpec(structure.raw, anchor);
-      if (!spec) throw new Error(`章节结构里找不到上传题组 ${anchor}`);
-      const questionType = uploadQuestionType(structure.raw, spec.groupId);
-      const uploaded = await uploadSampleFile(fetcher, auth);
-      const result = await submitChapterScore(
-        { token: auth.token, baseUrl: IPUB_BASE },
+      const leafs = await fetchUnitProgress(
         {
-          bookId: cfg.bookId,
-          bookVersionNumber: cfg.bookVersion,
-          chapterId,
-          chapterVersionNumber: chapterVersion,
-          referer: buildChapterReferer({
-            bookId: cfg.bookId,
-            bookVersionNumber: cfg.bookVersion,
-            chapterId,
-          }),
-        },
-        {
-          groupId: spec.groupId,
-          versionNumber: spec.versionNumber,
-          mode: 'score',
-          userAnswers: [
-            {
-              childId: spec.childId,
-              questionType,
-              userAnswerValue: buildUploadAnswerValue(uploaded),
-            },
-          ],
+          token: auth.token,
+          cookie: '',
+          courseId: cfg.id,
+          unit: String(found.unit.id),
+          openId: auth.open_id,
+          baseUrl: CONTENT_BASE,
         },
         fetcher,
       );
-      log(
-        'info',
-        `submitScore upload ${spec.groupId} type=${questionType} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
-      );
-      if (!result.ok) throw new Error(`upload submitScore failed: HTTP ${result.status}`);
+      if (Number(leafs?.[groupId]?.pass ?? 0) === 1) {
+        log('info', `upload ${groupId} already completed; skipped`);
+      } else {
+        const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
+        const spec = findUploadSpec(structure.raw, anchor);
+        if (!spec) throw new Error(`章节结构里找不到上传题组 ${anchor}`);
+        const questionType = uploadQuestionType(structure.raw, spec.groupId);
+        const uploaded = await uploadSampleFile(fetcher, auth);
+        await waitForSubmitSlot(session);
+        const result = await withRetry(
+          () =>
+            submitChapterScore(
+              { token: auth.token, baseUrl: IPUB_BASE },
+              {
+                bookId: cfg.bookId,
+                bookVersionNumber: cfg.bookVersion,
+                chapterId,
+                chapterVersionNumber: chapterVersion,
+                referer: buildChapterReferer({
+                  bookId: cfg.bookId,
+                  bookVersionNumber: cfg.bookVersion,
+                  chapterId,
+                }),
+              },
+              {
+                groupId: spec.groupId,
+                versionNumber: spec.versionNumber,
+                mode: 'score',
+                userAnswers: [
+                  {
+                    childId: spec.childId,
+                    questionType,
+                    userAnswerValue: buildUploadAnswerValue(uploaded),
+                  },
+                ],
+              },
+              fetcher,
+            ),
+          3,
+          900,
+        );
+        log(
+          'info',
+          `submitScore upload ${spec.groupId} type=${questionType} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
+        );
+        if (!result.ok) throw new Error(`upload submitScore failed: HTTP ${result.status}`);
+      }
     } else {
       return { status: 'needs_human', reason: `未支持的类型 ${base}` };
     }
