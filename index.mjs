@@ -3,6 +3,627 @@ import { createCipheriv as createCipheriv2, createHmac as createHmac3 } from "no
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
+// src/vendor/question-kind.ts
+var KIND_TABLE = {
+  single_choice: {
+    type: "single",
+    answerMode: "option",
+    fillable: true,
+    hint: "\u5355\u9009\u9898\uFF1A\u8FD4\u56DE 1 \u4E2A\u9009\u9879\u7684\u5B8C\u6574\u539F\u6587\u3002"
+  },
+  multiple_choice: {
+    type: "multiple",
+    answerMode: "option",
+    fillable: true,
+    hint: "\u591A\u9009\u9898\uFF1A\u8FD4\u56DE\u6240\u6709\u6B63\u786E\u9009\u9879\u7684\u5B8C\u6574\u539F\u6587\u3002"
+  },
+  true_false: {
+    type: "judge",
+    answerMode: "option",
+    fillable: true,
+    hint: "\u5224\u65AD\u9898\uFF1A\u8FD4\u56DE\u9009\u9879\u539F\u6587\uFF08\u5982\u201C\u6B63\u786E\u201D\u201C\u9519\u8BEF\u201D\uFF09\uFF0C\u4E0D\u8981\u8FD4\u56DE T/F\u3002"
+  },
+  fill_blanks: {
+    type: "fill",
+    answerMode: "blanks",
+    fillable: true,
+    hint: "\u586B\u7A7A\u9898\uFF1A\u6309 {{1}}\u2026{{n}} \u7684\u987A\u5E8F\uFF0C\u6BCF\u4E2A\u7A7A\u53EA\u8FD4\u56DE\u7F3A\u5931\u7684\u8BCD\u6216\u77ED\u8BED\uFF0C\u4E0D\u8981\u91CD\u590D\u6574\u53E5\uFF0C\u4E0D\u8981\u5E26\u5E8F\u53F7\u3002"
+  },
+  fill_blanks_choice: {
+    type: "fill",
+    answerMode: "blanks",
+    fillable: true,
+    hint: "\u9009\u8BCD\u586B\u7A7A\uFF1A\u53EA\u80FD\u4ECE options \u8BCD\u5E93\u4E2D\u9009\u8BCD\uFF0C\u6BCF\u4E2A\u8BCD\u6700\u591A\u4F7F\u7528\u4E00\u6B21\uFF0C\u6309\u7A7A\u987A\u5E8F\u8FD4\u56DE\u3002"
+  },
+  translation: {
+    type: "short",
+    answerMode: "text",
+    fillable: true,
+    hint: "\u7FFB\u8BD1/\u8865\u5168\uFF1A\u82E5\u9898\u5E72\u62EC\u53F7\u5185\u6709\u4E2D\u6587\uFF0C\u53EA\u8FD4\u56DE\u8BE5\u4E2D\u6587\u5BF9\u5E94\u7684\u82F1\u6587\u8868\u8FBE\uFF1B\u82E5\u6574\u53E5\u662F\u4E2D\u6587\uFF0C\u5219\u8FD4\u56DE\u5B8C\u6574\u82F1\u6587\u8BD1\u6587\u3002\u4E0D\u8981\u89E3\u91CA\u3002"
+  },
+  short_answer: {
+    type: "short",
+    answerMode: "text",
+    fillable: true,
+    hint: "\u7B80\u7B54\u9898\uFF1A\u7ED3\u5408\u9898\u5E72\u4F5C\u7B54\uFF1B\u82E5\u7ED9\u4E86 passage\uFF0C\u53EA\u7528\u5176\u4E2D\u4E8B\u5B9E\uFF0C\u4E0D\u8981\u590D\u8FF0\u539F\u6587\u3002\u7B54\u6848\u8981\u7B80\u77ED\u3001\u76F4\u63A5\u3002"
+  },
+  writing: {
+    type: "short",
+    answerMode: "text",
+    fillable: true,
+    hint: "\u5199\u4F5C\u9898\uFF1A\u6309\u9898\u5E72\u5B57\u6570\u4E0E\u7ED3\u6784\u8981\u6C42\u5199\u5B8C\u6574\u77ED\u6587\uFF0C\u53EA\u8F93\u51FA\u6B63\u6587\u3002"
+  },
+  text_match: {
+    type: "matching",
+    answerMode: "pairs",
+    fillable: true,
+    requiresDrag: true,
+    hint: "\u5339\u914D\u9898\uFF1A\u6309 pairs[].left \u7684\u987A\u5E8F\uFF0C\u8FD4\u56DE\u6BCF\u4E2A\u5DE6\u4FA7\u9879\u5BF9\u5E94\u7684\u53F3\u4FA7\u9009\u9879\u539F\u6587\u3002"
+  },
+  oral_personal_state: {
+    type: "speaking",
+    answerMode: "none",
+    fillable: false,
+    hint: ""
+  },
+  multi_media_upload: {
+    type: "upload",
+    answerMode: "none",
+    fillable: false,
+    hint: ""
+  },
+  discussion: {
+    type: "discussion",
+    answerMode: "none",
+    fillable: false,
+    hint: ""
+  },
+  rich_text_read: {
+    type: "reading",
+    answerMode: "none",
+    fillable: false,
+    hint: ""
+  },
+  rich_text_read_group: {
+    type: "reading",
+    answerMode: "none",
+    fillable: false,
+    hint: ""
+  }
+};
+var NON_FILLABLE = /* @__PURE__ */ new Set([
+  "oral_personal_state",
+  "multi_media_upload",
+  "discussion",
+  "rich_text_read",
+  "rich_text_read_group"
+]);
+function classifyQuestion(rawType) {
+  const raw = (rawType ?? "").trim();
+  const known = KIND_TABLE[raw];
+  if (known) {
+    return { rawType: raw, requiresDrag: false, ...known };
+  }
+  if (raw.endsWith("_group")) {
+    const base = raw.slice(0, -"_group".length);
+    const groupKnown = KIND_TABLE[base];
+    if (groupKnown) {
+      return { rawType: raw, requiresDrag: false, ...groupKnown };
+    }
+    if (NON_FILLABLE.has(base)) {
+      return {
+        rawType: raw,
+        type: "unknown",
+        answerMode: "none",
+        fillable: false,
+        requiresDrag: false,
+        hint: ""
+      };
+    }
+  }
+  return {
+    rawType: raw,
+    type: "unknown",
+    answerMode: "none",
+    fillable: false,
+    requiresDrag: false,
+    hint: ""
+  };
+}
+function stripReaderChrome(input) {
+  return input.replace(/\b(?:自动判题|计分|提交|预览|打开精读模式)\b/g, " ").replace(/\d+\s*\/\s*10000/g, " ").replace(/准备时长\s*\d{1,2}:\d{2}/g, " ").replace(/作答时长\s*\d{1,2}:\d{2}/g, " ").replace(/点击开始(?:录制|作答)?/g, " ").replace(/\d{1,2}:\d{2}\s*\/\s*\d{1,2}:\d{2}/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// src/vendor/paper.ts
+function lexicalText(value) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return lexicalText(JSON.parse(trimmed));
+      } catch {
+        return value;
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => lexicalText(item)).join("");
+  }
+  if (value && typeof value === "object") {
+    const node = value;
+    if (typeof node.text === "string") return node.text;
+    if (Array.isArray(node.children)) {
+      return node.children.map((item) => lexicalText(item)).join("");
+    }
+    if (node.root) return lexicalText(node.root);
+  }
+  return "";
+}
+
+// src/vendor/chapter-structure.ts
+function isObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function parseMaybeJson(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith('"') && !trimmed.startsWith("[")) {
+    return value;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+function anchorOf(node) {
+  const raw = node.$?.__anchor__ ?? node.id;
+  return typeof raw === "string" && raw.length > 0 ? raw : void 0;
+}
+function headingLevelOf(node) {
+  if (node.type !== "heading") return void 0;
+  const match = typeof node.tag === "string" ? node.tag.match(/^h([1-6])$/i) : null;
+  return match ? Number(match[1]) : 2;
+}
+function cleanInline(text) {
+  return text.replace(/[ \t\u00a0]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+function lexicalToStem(value) {
+  const blanks = [];
+  const parts = [];
+  const parsed = parseMaybeJson(value);
+  const walk = (node) => {
+    if (node === null || node === void 0) return;
+    if (typeof node === "string") {
+      parts.push(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    if (!isObject(node)) return;
+    switch (node.type) {
+      case "text":
+        parts.push(String(node.text ?? ""));
+        return;
+      case "linebreak":
+        parts.push("\n");
+        return;
+      case "insert-dig-empty": {
+        const index = blanks.length + 1;
+        blanks.push({
+          ...node.id ? { id: String(node.id) } : {},
+          index
+        });
+        parts.push(`{{${index}}}`);
+        return;
+      }
+      case "insert-image":
+        parts.push(" [\u56FE\u7247] ");
+        return;
+      case "insert-video":
+        parts.push(" [\u89C6\u9891] ");
+        return;
+      case "insert-audio":
+        parts.push(" [\u97F3\u9891] ");
+        return;
+      default:
+        if (node.root) walk(node.root);
+        else if (Array.isArray(node.children)) node.children.forEach(walk);
+    }
+  };
+  walk(parsed);
+  return { text: cleanInline(parts.join("")), blanks };
+}
+function optionText(option) {
+  const fromValue = lexicalText(option.optionValue);
+  if (fromValue.trim()) return fromValue.trim();
+  return String(option.label ?? "").trim();
+}
+function buildOptions(raw, child, groupType, rawType) {
+  const source = Array.isArray(child?.options) && child.options.length > 0 ? child.options : Array.isArray(raw.options) ? raw.options : [];
+  return source.map((option, index) => {
+    const label = String(option.label ?? "").trim();
+    const text = rawType === "fill_blanks_choice" && label ? label : optionText(option) || label;
+    const mapped = { index, text };
+    if (label) mapped.label = label;
+    if (option.optionId) mapped.value = String(option.optionId);
+    if (option.optionId) mapped.optionId = String(option.optionId);
+    return mapped;
+  }).filter((option) => option.text.length > 0);
+}
+function buildPairs(children) {
+  return children.map((child) => ({
+    ...child.childId ? { id: String(child.childId) } : {},
+    left: lexicalText(child.quesText).trim() || String(child.quesTextString ?? "").trim()
+  })).filter((pair) => pair.left.length > 0);
+}
+function buildStructureQuestion(raw, groupId, groupType, index = 0, groupVersion) {
+  if (!isObject(raw)) return null;
+  const children = Array.isArray(raw.children) ? raw.children : [];
+  const child = children[0];
+  const rawType = String(raw.questionType ?? groupType ?? "");
+  const kind = classifyQuestion(rawType);
+  const { text: lexicalStem, blanks: lexicalBlanks } = lexicalToStem(raw.quesText);
+  const pairs = kind.answerMode === "pairs" ? buildPairs(children) : [];
+  const childStem = children.map((item) => {
+    const text = lexicalToStem(item.quesText).text;
+    return text || String(item.quesTextString ?? "");
+  }).find((text) => text.trim().length > 0);
+  let stem = stripReaderChrome(
+    lexicalStem || String(raw.quesTextString ?? "") || childStem || ""
+  );
+  if (!stem && pairs.length > 0) {
+    stem = `Match each item with the correct option: ${pairs.map((pair) => pair.left).join(" / ")}`;
+  }
+  if (!stem) return null;
+  const blanks = lexicalBlanks.length > 0 ? lexicalBlanks : children.map((item, position) => ({
+    ...item.childId ? { id: String(item.childId) } : {},
+    index: position + 1
+  }));
+  const childIds = children.map((item) => item.childId ? String(item.childId) : "").filter(Boolean);
+  const options = kind.answerMode === "option" || kind.answerMode === "pairs" || rawType === "fill_blanks_choice" ? buildOptions(raw, child, groupType, rawType) : [];
+  const question = {
+    id: String(raw.id ?? child?.childId ?? `${groupId}:${index}`),
+    index,
+    type: kind.type,
+    stem,
+    options,
+    blankCount: kind.answerMode === "blanks" || kind.answerMode === "text" ? Math.max(blanks.length, 1) : 0,
+    answerMode: kind.answerMode,
+    rawType,
+    groupId,
+    ...groupVersion ? { groupVersion } : {},
+    ...childIds.length > 0 ? { childIds } : {}
+  };
+  if (blanks.length > 0 && (kind.answerMode === "blanks" || kind.answerMode === "text")) {
+    question.blanks = blanks;
+  }
+  if (pairs.length > 0) question.pairs = pairs;
+  if (typeof raw.score === "number") question.score = raw.score;
+  return question;
+}
+function normalizeGroup(raw) {
+  const value = parseMaybeJson(raw);
+  if (!isObject(value)) return null;
+  if (!Array.isArray(value.list)) return null;
+  return value;
+}
+function groupKey(group) {
+  return String(group.groupId ?? "");
+}
+function readingMaterial(group) {
+  const list = Array.isArray(group.list) ? group.list : [];
+  const paragraphs = [];
+  for (const item of list) {
+    const children = Array.isArray(item.children) ? item.children : [];
+    for (const child of children) {
+      const text = lexicalText(child.quesText).trim();
+      if (text) paragraphs.push(text);
+    }
+    if (paragraphs.length === 0) {
+      const text = String(item.quesTextString ?? "").trim();
+      if (text && !/^https?:/.test(text)) paragraphs.push(text);
+    }
+  }
+  return cleanInline(paragraphs.join("\n"));
+}
+var GENERIC_STEMS = /^(?:provide your answer here\.?|请在此处作答\.?)$/i;
+var PASSAGE_KINDS = /* @__PURE__ */ new Set([
+  "fill_blanks",
+  "fill_blanks_choice",
+  "single_choice",
+  "multiple_choice",
+  "true_false",
+  "text_match"
+]);
+function parseChapterStructure(input) {
+  const warnings = [];
+  const groups = /* @__PURE__ */ new Map();
+  const consumed = /* @__PURE__ */ new Set();
+  for (const raw of Array.isArray(input.questionList) ? input.questionList : []) {
+    const group = normalizeGroup(raw);
+    if (group && groupKey(group)) groups.set(groupKey(group), group);
+  }
+  const content = parseMaybeJson(input.content);
+  const root = isObject(content) && isObject(content.root) ? content.root : content;
+  const children = isObject(root) && Array.isArray(root.children) ? root.children : [];
+  if (children.length === 0) {
+    warnings.push("chapter content has no renderable nodes");
+    return { activities: [], nodes: [], warnings };
+  }
+  const nodes = children.map((node, index) => {
+    const headingLevel = headingLevelOf(node);
+    const text = node.type === "question-block" ? "" : cleanInline(lexicalText(node));
+    return {
+      index,
+      type: String(node.type ?? "unknown"),
+      ...anchorOf(node) ? { anchor: anchorOf(node) } : {},
+      ...headingLevel ? { headingLevel } : {},
+      ...typeof node.tag === "string" ? { tag: node.tag } : {},
+      text,
+      ...node.questionType ? { questionType: String(node.questionType) } : {},
+      ...node.questionGroup ? { questionGroupId: String(node.questionGroup) } : {}
+    };
+  });
+  const activities = [];
+  const passageStack = [];
+  const headingStack = [];
+  let current = null;
+  let instructionParts = [];
+  const activePassage = () => {
+    const entry = passageStack[passageStack.length - 1];
+    return entry ? { text: entry.text, anchor: entry.anchor } : void 0;
+  };
+  for (let index = 0; index < children.length; index += 1) {
+    const node = children[index];
+    const info = nodes[index];
+    if (node.type === "heading") {
+      if (current) current.endIndex = index;
+      const level = info.headingLevel ?? 2;
+      while (headingStack.length > 0 && headingStack[headingStack.length - 1] >= level) {
+        headingStack.pop();
+      }
+      const parentLevel = headingStack[headingStack.length - 1];
+      headingStack.push(level);
+      while (passageStack.length > 0 && passageStack[passageStack.length - 1].ownerLevel >= level) {
+        passageStack.pop();
+      }
+      current = {
+        anchor: info.anchor ?? `heading-${index}`,
+        title: info.text,
+        level,
+        ...parentLevel !== void 0 ? { parentLevel } : {},
+        startIndex: index,
+        endIndex: children.length,
+        questionGroups: [],
+        questions: []
+      };
+      instructionParts = [];
+      activities.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (node.type === "question-block") {
+      const group = normalizeGroup(node.questionData) ?? groups.get(info.questionGroupId ?? "") ?? null;
+      const groupId = info.questionGroupId ?? (group ? groupKey(group) : "");
+      const groupType = String(group?.groupType ?? node.questionType ?? info.questionType ?? "");
+      if (info.questionGroupId) consumed.add(info.questionGroupId);
+      if (group) consumed.add(groupKey(group));
+      if (!group && !info.questionType) {
+        warnings.push(`block #${index}: unresolved question group`);
+        continue;
+      }
+      if (groupType === "rich_text_read_group" || groupType === "rich_text_read") {
+        const text = group ? readingMaterial(group) : "";
+        if (text.length > 200) {
+          passageStack.push({
+            ownerLevel: current.parentLevel ?? current.level,
+            text: text.slice(0, 12e3),
+            anchor: current.anchor
+          });
+        } else {
+          warnings.push(`block #${index}: reading material too short to use as passage`);
+        }
+        continue;
+      }
+      const list = Array.isArray(group?.list) ? group.list : [];
+      const questions = [];
+      const groupVersion = group?.versionNumber ? String(group.versionNumber) : void 0;
+      for (const raw of list) {
+        const question = buildStructureQuestion(
+          raw,
+          groupId,
+          groupType,
+          current.questions.length,
+          groupVersion
+        );
+        if (question) questions.push(question);
+      }
+      if (questions.length === 0) continue;
+      const passage = activePassage();
+      if (passage) {
+        let applied = false;
+        for (const question of questions) {
+          if (PASSAGE_KINDS.has(question.rawType ?? "")) {
+            question.passage = passage.text;
+            applied = true;
+          }
+        }
+        if (applied) {
+          current.passage = passage.text;
+          current.passageAnchor = passage.anchor;
+        }
+      }
+      const instruction = stripReaderChrome(instructionParts.join(" ").trim());
+      if (instruction) {
+        for (const question of questions) {
+          if (GENERIC_STEMS.test(question.stem)) {
+            question.stem = instruction;
+            continue;
+          }
+          if (!question.instruction) question.instruction = instruction;
+        }
+        if (!current.instruction) current.instruction = instruction;
+      }
+      current.questions.push(...questions);
+      const questionTypes = [...new Set(questions.map((question) => question.rawType ?? question.type))];
+      current.questionGroups.push({
+        groupId,
+        groupType,
+        ...groupVersion ? { versionNumber: groupVersion } : {},
+        questionCount: questions.length,
+        questionTypes
+      });
+      instructionParts = [];
+      continue;
+    }
+    if (info.text) instructionParts.push(info.text);
+  }
+  if (current) current.endIndex = children.length;
+  for (const [groupId, group] of groups) {
+    if (consumed.has(groupId)) continue;
+    const list = Array.isArray(group.list) ? group.list : [];
+    const groupType = String(group.groupType ?? "");
+    const groupVersion = group.versionNumber ? String(group.versionNumber) : void 0;
+    const questions = [];
+    for (const raw of list) {
+      const question = buildStructureQuestion(
+        raw,
+        groupId,
+        groupType,
+        questions.length,
+        groupVersion
+      );
+      if (question) questions.push(question);
+    }
+    if (questions.length === 0) {
+      warnings.push(`unmapped question group ${groupId}: no parseable questions`);
+      continue;
+    }
+    const instruction = stripReaderChrome(String(group.direction ?? "").trim());
+    const material = stripReaderChrome(String(group.material ?? "").trim());
+    const title = instruction || `Unmapped questions (${groupType || groupId})`;
+    if (instruction) {
+      for (const question of questions) {
+        if (!question.instruction) question.instruction = instruction;
+      }
+    }
+    if (material) {
+      for (const question of questions) {
+        if (PASSAGE_KINDS.has(question.rawType ?? "")) {
+          question.passage = material.slice(0, 12e3);
+        }
+      }
+    }
+    activities.push({
+      anchor: `unmapped-${groupId}`,
+      title,
+      level: 2,
+      startIndex: children.length,
+      endIndex: children.length,
+      questionGroups: [
+        {
+          groupId,
+          groupType,
+          ...groupVersion ? { versionNumber: groupVersion } : {},
+          questionCount: questions.length,
+          questionTypes: [...new Set(questions.map((question) => question.rawType ?? question.type))]
+        }
+      ],
+      questions,
+      ...instruction ? { instruction } : {},
+      ...material ? { passage: material.slice(0, 12e3) } : {},
+      unmapped: true
+    });
+    warnings.push(`unmapped question group ${groupId} kept as "${title}"`);
+  }
+  const total = activities.reduce((sum, activity) => sum + activity.questions.length, 0);
+  if (total === 0) warnings.push("no questions found in chapter structure");
+  return { activities, nodes, warnings };
+}
+async function loadChapterStructure(data, fetcher = fetch) {
+  const content = data.content;
+  if (typeof content === "string" && /^https?:\/\//i.test(content)) {
+    const response = await fetcher(content);
+    if (!response.ok) {
+      throw new Error(`failed to fetch chapter content: HTTP ${response.status}`);
+    }
+    const parsed = await response.json();
+    return parseChapterStructure({ ...data, content: parsed });
+  }
+  return parseChapterStructure(data);
+}
+
+// src/vendor/parser/normalize.ts
+function normalizeText(input) {
+  return input.replace(/\u00a0/g, " ").replace(
+    /[\uff01-\uff5e]/g,
+    (ch) => String.fromCharCode(ch.charCodeAt(0) - 65248)
+  ).replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"').replace(/\s+/g, " ").trim().toLowerCase().replace(/[.,;:!?'"()[\]{}<>/\\|`~@#$%^&*+=_-]/g, "").replace(/\s+/g, " ").trim();
+}
+function isBareOptionLetter(text) {
+  return /^[a-dA-D]$/.test(text.trim());
+}
+
+// src/vendor/matcher.ts
+var TRUE_WORDS = /* @__PURE__ */ new Set(["\u5BF9", "\u6B63\u786E", "\u662F", "true", "t", "yes", "y"]);
+var FALSE_WORDS = /* @__PURE__ */ new Set(["\u9519", "\u9519\u8BEF", "\u5426", "false", "f", "no", "n"]);
+function judgeValue(text) {
+  const value = text.trim().toLowerCase();
+  if (TRUE_WORDS.has(value)) return "true";
+  if (FALSE_WORDS.has(value)) return "false";
+  return null;
+}
+function tokens(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) return /* @__PURE__ */ new Set();
+  if (normalized.includes(" ")) {
+    return new Set(normalized.split(" ").filter(Boolean));
+  }
+  const chars = [...normalized];
+  const grams = new Set(chars);
+  for (let i = 0; i < chars.length - 1; i += 1) {
+    grams.add(chars[i] + chars[i + 1]);
+  }
+  return grams;
+}
+function jaccard(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const value of a) {
+    if (b.has(value)) intersection += 1;
+  }
+  return intersection / (a.size + b.size - intersection);
+}
+function similarity(left, right) {
+  const leftJudge = judgeValue(left);
+  const rightJudge = judgeValue(right);
+  if (leftJudge && rightJudge) return leftJudge === rightJudge ? 1 : 0;
+  const a = normalizeText(left);
+  const b = normalizeText(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) {
+    const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length);
+    return 0.82 + ratio * 0.12;
+  }
+  return jaccard(tokens(a), tokens(b));
+}
+function matchOption(answerText, options, threshold = 0.6) {
+  if (isBareOptionLetter(answerText)) return null;
+  let best = null;
+  for (const option of options) {
+    if (!option.text) continue;
+    const score = similarity(answerText, option.text);
+    if (!best || score > best.score) best = { option, score };
+  }
+  if (!best || best.score < threshold) return null;
+  return best;
+}
+
 // src/vendor/submit-signature.ts
 import { createHmac } from "node:crypto";
 var PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43];
@@ -83,6 +704,219 @@ function signedHeaders(token, referer, timestamp, openId) {
 function buildChapterReferer(ids) {
   return `https://ipub.unipus.cn/learner/textbook/book/${ids.bookId}/chapter/${ids.chapterId}?bookVersionNumber=${ids.bookVersionNumber}`;
 }
+function chapterVersionFromContent(content) {
+  if (typeof content !== "string") return void 0;
+  const match = content.match(/\/([^/]+)\/studentContent\.json/);
+  return match?.[1];
+}
+async function fetchChapterStructure(options, ids, fetcher = fetch) {
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const query = new URLSearchParams({
+    bookId: ids.bookId,
+    bookVersionNumber: ids.bookVersionNumber,
+    chapterId: ids.chapterId
+  });
+  const response = await fetcher(
+    `${baseUrl}/api/reader/chapter/getChapterInfo?${query.toString()}`,
+    { headers: baseHeaders(options.token) }
+  );
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `getChapterInfo failed: HTTP ${response.status} ${text.slice(0, 200)}`
+    );
+  }
+  const json = JSON.parse(text);
+  if (json.code !== void 0 && json.code !== 200) {
+    throw new Error(
+      `getChapterInfo rejected: code ${json.code} ${text.slice(0, 200)}`
+    );
+  }
+  const data = json.data ?? {};
+  const structure = await loadChapterStructure(data, fetcher);
+  const chapterVersionNumber = (data.chapterVersionNumber ? String(data.chapterVersionNumber) : void 0) ?? (data.versionNumber ? String(data.versionNumber) : void 0) ?? chapterVersionFromContent(data.content);
+  return {
+    structure,
+    ...chapterVersionNumber ? { chapterVersionNumber } : {},
+    raw: data
+  };
+}
+function optionIdOf(question, text) {
+  const match = matchOption(text, question.options);
+  if (!match) return void 0;
+  return match.option.optionId ?? match.option.value;
+}
+var AI_GRADED = /* @__PURE__ */ new Set([
+  "writing",
+  "short_answer",
+  "translation",
+  "oral_personal_state"
+]);
+function buildChapterSubmissions(questions, answers) {
+  const byId = new Map(answers.map((answer) => [answer.questionId, answer]));
+  const groups = /* @__PURE__ */ new Map();
+  const warnings = [];
+  const merge = (question, records) => {
+    const groupId = question.groupId;
+    const versionNumber = question.groupVersion;
+    const answeredJudge = records.some(
+      (record) => record.userAnswerValue !== "" && AI_GRADED.has(record.questionType) && // Zero-point questions (short_answer / discussion prompts) are never
+      // AI-graded by the platform: `judgeStart` answers with an empty
+      // `judgeTaskList`, and the answer only needs a plain `submitScore`.
+      question.score !== 0
+    );
+    if (question.score === 0 && records.some(
+      (record) => record.userAnswerValue !== "" && AI_GRADED.has(record.questionType)
+    )) {
+      warnings.push(
+        `${question.id}: 0-point ${question.rawType ?? question.type}; submitted without AI grading`
+      );
+    }
+    const existing = groups.get(groupId);
+    if (!existing) {
+      groups.set(groupId, {
+        groupId,
+        versionNumber,
+        mode: answeredJudge ? "judge" : "score",
+        userAnswers: records
+      });
+      return;
+    }
+    if (existing.versionNumber !== versionNumber) {
+      warnings.push(
+        `${question.id}: group version mismatch (${existing.versionNumber} != ${versionNumber})`
+      );
+    }
+    if (answeredJudge) existing.mode = "judge";
+    existing.userAnswers.push(...records);
+  };
+  const pushAll = (question, values) => {
+    merge(
+      question,
+      values.map(({ childId, value }) => ({
+        childId,
+        questionType: question.rawType ?? question.type,
+        userAnswerValue: value,
+        questionId: question.id
+      }))
+    );
+  };
+  for (const question of questions) {
+    if (!question.groupId || !question.groupVersion) {
+      warnings.push(`${question.id}: missing groupId/versionNumber`);
+      continue;
+    }
+    const questionType = question.rawType ?? question.type;
+    const kind = classifyQuestion(questionType);
+    const childIds = question.childIds ?? [];
+    const blankIds = childIds.length > 0 ? childIds : (question.blanks ?? []).map((blank) => blank.id).filter((id) => Boolean(id));
+    const answer = byId.get(question.id);
+    const answered = Boolean(answer && answer.texts.length > 0);
+    if (!answered) {
+      const emptyIds = kind.answerMode === "pairs" ? (question.pairs ?? []).map((pair) => pair.id).filter((id) => Boolean(id)) : blankIds.length > 0 ? blankIds : [question.id];
+      pushAll(
+        question,
+        emptyIds.map((childId) => ({ childId, value: "" }))
+      );
+      continue;
+    }
+    const texts = answer.texts;
+    if (kind.answerMode === "option") {
+      const ids = texts.map((text) => optionIdOf(question, text)).filter((id) => Boolean(id));
+      if (ids.length === 0) {
+        warnings.push(
+          `${question.id}: no option id matched [${texts.join(" | ")}]`
+        );
+        continue;
+      }
+      const value = questionType === "true_false" ? ids[0] ?? "" : JSON.stringify(ids);
+      pushAll(question, [{ childId: blankIds[0] ?? question.id, value }]);
+      continue;
+    }
+    if (kind.answerMode === "pairs") {
+      const pairs = question.pairs ?? [];
+      const values = [];
+      for (let index = 0; index < pairs.length; index += 1) {
+        const pair = pairs[index];
+        if (!pair.id) continue;
+        const text = texts[index];
+        if (!text) {
+          values.push({ childId: pair.id, value: "" });
+          continue;
+        }
+        const optionId = optionIdOf(question, text);
+        if (!optionId) {
+          warnings.push(
+            `${question.id}: pair ${index + 1} "${text}" did not match any option`
+          );
+          values.push({ childId: pair.id, value: "" });
+          continue;
+        }
+        values.push({ childId: pair.id, value: JSON.stringify([optionId]) });
+      }
+      pushAll(question, values);
+      continue;
+    }
+    if (kind.answerMode === "blanks") {
+      if (blankIds.length === 0) {
+        warnings.push(`${question.id}: no blank ids`);
+        continue;
+      }
+      pushAll(
+        question,
+        blankIds.map((childId, index) => ({
+          childId,
+          value: texts[index] ?? ""
+        }))
+      );
+      continue;
+    }
+    if (kind.answerMode === "text") {
+      pushAll(question, [
+        { childId: blankIds[0] ?? question.id, value: texts.join("\n") }
+      ]);
+      continue;
+    }
+    pushAll(
+      question,
+      (blankIds.length > 0 ? blankIds : [question.id]).map((childId) => ({
+        childId,
+        value: ""
+      }))
+    );
+  }
+  const submissions = [];
+  for (const group of groups.values()) {
+    if (!group.userAnswers.some((record) => record.userAnswerValue !== "")) {
+      warnings.push(`${group.groupId}: no answered questions; skipped`);
+      continue;
+    }
+    submissions.push(group);
+  }
+  return { submissions, warnings };
+}
+function buildChapterSubmitPayload(meta, submission) {
+  const a = meta.timestamp ?? Date.now();
+  const b = meta.endTimestamp ?? a;
+  return {
+    groupId: submission.groupId,
+    userAnswers: submission.userAnswers.map(
+      ({ childId, questionType, userAnswerValue, bizAnswerId }) => ({
+        childId,
+        questionType,
+        userAnswerValue,
+        ...bizAnswerId ? { bizAnswerId } : {}
+      })
+    ),
+    versionNumber: submission.versionNumber,
+    bookId: meta.bookId,
+    bookVersionNumber: meta.bookVersionNumber,
+    chapterId: meta.chapterId,
+    chapterVersionNumber: meta.chapterVersionNumber,
+    a,
+    b
+  };
+}
 async function postJson(options, path, meta, payload, fetcher) {
   const a = Number(payload.a ?? Date.now());
   const response = await fetcher(`${options.baseUrl ?? DEFAULT_BASE_URL}${path}`, {
@@ -103,6 +937,40 @@ async function postJson(options, path, meta, payload, fetcher) {
     body,
     ...json !== void 0 ? { json } : {},
     payload
+  };
+}
+async function submitChapterScore(options, meta, submission, fetcher = fetch) {
+  return postJson(
+    options,
+    "/api/reader/answer/submitScore",
+    meta,
+    buildChapterSubmitPayload(meta, submission),
+    fetcher
+  );
+}
+async function fetchChapterAnswerList(options, groupId, versionNumber, fetcher = fetch) {
+  const url = `${options.baseUrl ?? DEFAULT_BASE_URL}/api/reader/answer/list?questionId=${encodeURIComponent(groupId)}&versionNumber=${encodeURIComponent(versionNumber)}`;
+  const response = await fetcher(url, {
+    method: "GET",
+    headers: {
+      authorization: authHeader(options.token),
+      lovefrom: "learner",
+      accept: "application/json"
+    }
+  });
+  const body = await response.text();
+  let data;
+  try {
+    const json = JSON.parse(body);
+    if (json.code === 200 && json.data) data = json.data;
+  } catch {
+    data = void 0;
+  }
+  return {
+    ok: response.ok,
+    status: response.status,
+    body,
+    ...data ? { data } : {}
   };
 }
 async function finishChapterNode(options, meta, node, fetcher = fetch) {
@@ -780,6 +1648,138 @@ function isVideoGroup(base) {
 function isTextGroup(base) {
   return TEXT_LEAF_BASES.includes(base);
 }
+var structureCache = /* @__PURE__ */ new Map();
+async function getChapterStructure(fetcher, token, cfg, chapterId) {
+  const key = `${cfg.bookId}:${chapterId}`;
+  const cached = structureCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1e3) return cached.value;
+  const value = await fetchChapterStructure(
+    { token, baseUrl: IPUB_BASE },
+    { bookId: cfg.bookId, bookVersionNumber: cfg.bookVersion, chapterId },
+    fetcher
+  );
+  structureCache.set(key, { at: Date.now(), value });
+  return value;
+}
+async function readCachedAnswers(session, key) {
+  try {
+    const stored = await hostCall("cw.state", { session, namespace: "answers", key });
+    const value = stored?.value;
+    return Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+async function solveQuestions(session, activity) {
+  const payload = (activity.questions ?? []).map((question) => ({
+    id: question.id,
+    type: question.type,
+    stem: question.stem,
+    options: (question.options ?? []).map((option) => option.text),
+    blanks: question.blankCount ?? 0,
+    ...question.passage ? { passage: question.passage } : {}
+  }));
+  const prompt = [
+    "\u4F60\u662F U\u6821\u56ED \u82F1\u8BED\u8BFE\u7A0B\u7B54\u9898\u52A9\u624B\u3002",
+    '\u53EA\u8F93\u51FA JSON \u6570\u7EC4\uFF0C\u4E0D\u8981\u89E3\u91CA\u3002\u6BCF\u9879\u683C\u5F0F {"id":"\u9898\u76EEid","texts":["\u7B54\u6848"]}\u3002',
+    "\u9009\u62E9\u9898 texts \u5FC5\u987B\u662F\u9009\u9879\u539F\u6587\uFF0C\u4E0D\u8981\u7528 A/B/C/D\u3002",
+    "\u586B\u7A7A\u9898\u6309\u7A7A\u4F4D\u987A\u5E8F\u7ED9\u51FA\u591A\u4E2A texts\u3002",
+    JSON.stringify(payload)
+  ].join("\n");
+  const response = await hostCall("cw.ai.generate", { session, prompt });
+  const raw = String(response?.text ?? "").trim();
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+  const parsed = JSON.parse(cleaned);
+  const byId = /* @__PURE__ */ new Map();
+  for (const item of Array.isArray(parsed) ? parsed : []) {
+    if (!item || typeof item !== "object") continue;
+    const id = String(item.id ?? "");
+    const texts = Array.isArray(item.texts) ? item.texts.map(String) : [];
+    if (id) byId.set(id, texts);
+  }
+  return (activity.questions ?? []).map((question) => ({
+    questionId: question.id,
+    texts: byId.get(question.id) ?? [],
+    confidence: 0.8,
+    source: "llm"
+  }));
+}
+async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
+  const parts = rawId.split("::");
+  const chapterId = parts[1] ?? "";
+  const key = decodeURIComponent(parts[2] ?? "");
+  const index = Number(parts[3] ?? 0);
+  const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
+  const activities = structure?.structure?.activities ?? [];
+  const activity = activities.find((item) => String(item.anchor ?? item.title) === key) ?? activities[index];
+  if (!activity || !Array.isArray(activity.questions) || activity.questions.length === 0) {
+    throw { code: "not_found", message: "\u7AE0\u8282\u7ED3\u6784\u91CC\u627E\u4E0D\u5230\u8BE5\u9898\u76EE\u7EC4" };
+  }
+  const chapterVersion = structure.chapterVersionNumber ?? await fetchChapterVersion(fetcher, auth.token, cfg, chapterId);
+  const meta = {
+    bookId: cfg.bookId,
+    bookVersionNumber: cfg.bookVersion,
+    chapterId,
+    chapterVersionNumber: chapterVersion,
+    referer: buildChapterReferer({
+      bookId: cfg.bookId,
+      bookVersionNumber: cfg.bookVersion,
+      chapterId
+    })
+  };
+  if (params.checkpoint?.phase !== "submitted") {
+    let answers = await readCachedAnswers(session, rawId);
+    if (!answers) {
+      answers = await solveQuestions(session, activity);
+      await hostCall("cw.state", {
+        session,
+        namespace: "answers",
+        key: rawId,
+        value: answers
+      });
+    }
+    const { submissions, warnings } = buildChapterSubmissions(activity.questions, answers);
+    if (warnings.length > 0) log("warn", `chapter warnings: ${warnings.join("; ")}`);
+    if (submissions.some((submission) => submission.mode === "judge")) {
+      return { status: "needs_human", reason: "\u4E3B\u89C2\u9898\u9700\u8981 AI \u5224\u5206\uFF0C\u6682\u672A\u63A5\u5165" };
+    }
+    for (const submission of submissions) {
+      const result = await submitChapterScore(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        meta,
+        submission,
+        fetcher
+      );
+      log(
+        "info",
+        `submitScore ${submission.groupId} HTTP ${result.status} code ${result.json?.code ?? "?"}`
+      );
+      if (!result.ok) throw new Error(`submitScore failed: HTTP ${result.status}`);
+    }
+  }
+  const checks = [];
+  for (const group of activity.questionGroups ?? []) {
+    const version = group.versionNumber ?? activity.questions.find((question) => question.groupId === group.groupId)?.groupVersion ?? "";
+    const result = await fetchChapterAnswerList(
+      { token: auth.token, baseUrl: IPUB_BASE },
+      group.groupId,
+      version,
+      fetcher
+    );
+    const answered = Boolean(
+      result.data && (result.data.score !== void 0 || (result.data.userAnswersResult?.length ?? 0) > 0)
+    );
+    checks.push(answered);
+  }
+  if (checks.length > 0 && checks.every(Boolean)) {
+    return {
+      status: "completed",
+      evidence: { platform_confirmed: true, groups: checks.length },
+      checkpoint: { phase: "done" }
+    };
+  }
+  return { status: "in_progress", wait_ms: 2e3, checkpoint: { phase: "submitted" } };
+}
 async function catalogCourses(params) {
   const session = String(params.session ?? "");
   if (SOURCE === "live") {
@@ -931,6 +1931,32 @@ async function catalogUnits(params) {
         });
       });
     }
+    if (SETTINGS.include_questions !== false && chapterId) {
+      try {
+        const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
+        const activities = structure?.structure?.activities ?? [];
+        activities.forEach((activity, activityIndex) => {
+          if (!activity.questions?.length) return;
+          const key = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
+          units.push({
+            id: `q::${chapterId}::${encodeURIComponent(key)}::${activityIndex}`,
+            name: String(activity.title ?? `\u9898\u76EE ${activityIndex + 1}`).trim(),
+            chapter_id: chapterId,
+            chapter_name: chapterName,
+            lesson_id: activity.anchor ?? "",
+            kind: "document",
+            duration_seconds: 0,
+            watched_seconds: 0,
+            state: "not_started",
+            video_id: null,
+            selectable: true,
+            selectable_note: (activity.questionGroups ?? []).map((group) => group.groupType).filter(Boolean).join(",")
+          });
+        });
+      } catch (error) {
+        log("warn", `chapter structure ${chapterId} failed: ${errorText(error)}`);
+      }
+    }
   }
   log("info", `catalog.units course=${cfg.id} units=${units.length}`);
   return { units };
@@ -965,6 +1991,11 @@ async function studyStep(params) {
   }
   const unit = params.unit ?? {};
   const rawId = String(unit.id ?? "");
+  if (rawId.startsWith("q::")) {
+    const auth2 = await readAuth(session);
+    const fetcher2 = hostFetchFor(session);
+    return studyQuestionStep(params, session, cfg, auth2, fetcher2, rawId);
+  }
   const groupId = rawId.split("::")[0];
   if (!groupId) throw { code: "invalid_params", message: "\u7F3A\u5C11\u5355\u5143 id" };
   const auth = await readAuth(session);

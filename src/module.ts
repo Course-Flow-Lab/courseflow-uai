@@ -25,6 +25,13 @@ import {
   markVideoWatched,
 } from './vendor/video.js';
 import { markNodeRead, TEXT_LEAF_BASES } from './vendor/reading.js';
+import {
+  buildChapterReferer,
+  buildChapterSubmissions,
+  fetchChapterAnswerList,
+  fetchChapterStructure,
+  submitChapterScore,
+} from './vendor/chapter-api.js';
 
 const MANIFEST = JSON.parse(
   readFileSync(new URL('./courseflow.module.json', import.meta.url), 'utf8'),
@@ -658,6 +665,168 @@ function isTextGroup(base: string): boolean {
   return (TEXT_LEAF_BASES as readonly string[]).includes(base);
 }
 
+const structureCache = new Map<string, { at: number; value: any }>();
+
+async function getChapterStructure(
+  fetcher: any,
+  token: string,
+  cfg: any,
+  chapterId: string,
+): Promise<any> {
+  const key = `${cfg.bookId}:${chapterId}`;
+  const cached = structureCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.value;
+  const value = await fetchChapterStructure(
+    { token, baseUrl: IPUB_BASE },
+    { bookId: cfg.bookId, bookVersionNumber: cfg.bookVersion, chapterId },
+    fetcher,
+  );
+  structureCache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+async function readCachedAnswers(session: string, key: string): Promise<any[] | null> {
+  try {
+    const stored = await hostCall('cw.state', { session, namespace: 'answers', key });
+    const value = (stored as any)?.value;
+    return Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function solveQuestions(session: string, activity: any): Promise<any[]> {
+  const payload = (activity.questions ?? []).map((question: any) => ({
+    id: question.id,
+    type: question.type,
+    stem: question.stem,
+    options: (question.options ?? []).map((option: any) => option.text),
+    blanks: question.blankCount ?? 0,
+    ...(question.passage ? { passage: question.passage } : {}),
+  }));
+  const prompt = [
+    '你是 U校园 英语课程答题助手。',
+    '只输出 JSON 数组，不要解释。每项格式 {"id":"题目id","texts":["答案"]}。',
+    '选择题 texts 必须是选项原文，不要用 A/B/C/D。',
+    '填空题按空位顺序给出多个 texts。',
+    JSON.stringify(payload),
+  ].join('\n');
+  const response = await hostCall('cw.ai.generate', { session, prompt });
+  const raw = String((response as any)?.text ?? '').trim();
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
+  const parsed = JSON.parse(cleaned);
+  const byId = new Map<string, string[]>();
+  for (const item of Array.isArray(parsed) ? parsed : []) {
+    if (!item || typeof item !== 'object') continue;
+    const id = String(item.id ?? '');
+    const texts = Array.isArray(item.texts) ? item.texts.map(String) : [];
+    if (id) byId.set(id, texts);
+  }
+  return (activity.questions ?? []).map((question: any) => ({
+    questionId: question.id,
+    texts: byId.get(question.id) ?? [],
+    confidence: 0.8,
+    source: 'llm',
+  }));
+}
+
+async function studyQuestionStep(
+  params: any,
+  session: string,
+  cfg: any,
+  auth: any,
+  fetcher: any,
+  rawId: string,
+): Promise<any> {
+  const parts = rawId.split('::');
+  const chapterId = parts[1] ?? '';
+  const key = decodeURIComponent(parts[2] ?? '');
+  const index = Number(parts[3] ?? 0);
+
+  const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
+  const activities = structure?.structure?.activities ?? [];
+  const activity =
+    activities.find((item: any) => String(item.anchor ?? item.title) === key) ??
+    activities[index];
+  if (!activity || !Array.isArray(activity.questions) || activity.questions.length === 0) {
+    throw { code: 'not_found', message: '章节结构里找不到该题目组' };
+  }
+
+  const chapterVersion =
+    structure.chapterVersionNumber ??
+    (await fetchChapterVersion(fetcher, auth.token, cfg, chapterId));
+  const meta = {
+    bookId: cfg.bookId,
+    bookVersionNumber: cfg.bookVersion,
+    chapterId,
+    chapterVersionNumber: chapterVersion,
+    referer: buildChapterReferer({
+      bookId: cfg.bookId,
+      bookVersionNumber: cfg.bookVersion,
+      chapterId,
+    }),
+  };
+
+  if (params.checkpoint?.phase !== 'submitted') {
+    let answers = await readCachedAnswers(session, rawId);
+    if (!answers) {
+      answers = await solveQuestions(session, activity);
+      await hostCall('cw.state', {
+        session,
+        namespace: 'answers',
+        key: rawId,
+        value: answers,
+      });
+    }
+    const { submissions, warnings } = buildChapterSubmissions(activity.questions, answers);
+    if (warnings.length > 0) log('warn', `chapter warnings: ${warnings.join('; ')}`);
+    if (submissions.some((submission: any) => submission.mode === 'judge')) {
+      return { status: 'needs_human', reason: '主观题需要 AI 判分，暂未接入' };
+    }
+    for (const submission of submissions) {
+      const result = await submitChapterScore(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        meta,
+        submission,
+        fetcher,
+      );
+      log(
+        'info',
+        `submitScore ${submission.groupId} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
+      );
+      if (!result.ok) throw new Error(`submitScore failed: HTTP ${result.status}`);
+    }
+  }
+
+  const checks: boolean[] = [];
+  for (const group of activity.questionGroups ?? []) {
+    const version =
+      group.versionNumber ??
+      activity.questions.find((question: any) => question.groupId === group.groupId)?.groupVersion ??
+      '';
+    const result = await fetchChapterAnswerList(
+      { token: auth.token, baseUrl: IPUB_BASE },
+      group.groupId,
+      version,
+      fetcher,
+    );
+    const answered = Boolean(
+      result.data &&
+        (result.data.score !== undefined ||
+          (result.data.userAnswersResult?.length ?? 0) > 0),
+    );
+    checks.push(answered);
+  }
+  if (checks.length > 0 && checks.every(Boolean)) {
+    return {
+      status: 'completed',
+      evidence: { platform_confirmed: true, groups: checks.length },
+      checkpoint: { phase: 'done' },
+    };
+  }
+  return { status: 'in_progress', wait_ms: 2000, checkpoint: { phase: 'submitted' } };
+}
+
 async function catalogCourses(params) {
   const session = String(params.session ?? '');
   if (SOURCE === 'live') {
@@ -818,6 +987,36 @@ async function catalogUnits(params) {
         });
       });
     }
+
+    if (SETTINGS.include_questions !== false && chapterId) {
+      try {
+        const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
+        const activities = structure?.structure?.activities ?? [];
+        activities.forEach((activity: any, activityIndex: number) => {
+          if (!activity.questions?.length) return;
+          const key = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
+          units.push({
+            id: `q::${chapterId}::${encodeURIComponent(key)}::${activityIndex}`,
+            name: String(activity.title ?? `题目 ${activityIndex + 1}`).trim(),
+            chapter_id: chapterId,
+            chapter_name: chapterName,
+            lesson_id: activity.anchor ?? '',
+            kind: 'document',
+            duration_seconds: 0,
+            watched_seconds: 0,
+            state: 'not_started',
+            video_id: null,
+            selectable: true,
+            selectable_note: (activity.questionGroups ?? [])
+              .map((group: any) => group.groupType)
+              .filter(Boolean)
+              .join(','),
+          });
+        });
+      } catch (error) {
+        log('warn', `chapter structure ${chapterId} failed: ${errorText(error)}`);
+      }
+    }
   }
 
   log('info', `catalog.units course=${cfg.id} units=${units.length}`);
@@ -855,6 +1054,11 @@ async function studyStep(params) {
   }
   const unit = params.unit ?? {};
   const rawId = String(unit.id ?? '');
+  if (rawId.startsWith('q::')) {
+    const auth = await readAuth(session);
+    const fetcher: any = hostFetchFor(session);
+    return studyQuestionStep(params, session, cfg, auth, fetcher, rawId);
+  }
   const groupId = rawId.split('::')[0];
   if (!groupId) throw { code: 'invalid_params', message: '缺少单元 id' };
 

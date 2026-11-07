@@ -12,7 +12,7 @@
     "short": "U校园",
     "login": ["password"],
     "operations": ["study", "trial"],
-    "unit_kinds": ["video", "reading"],
+    "unit_kinds": ["video", "reading", "document"],
     "presentation": {
       "tabs": [{ "id": "study", "label": "学习目录" }],
       "actions": []
@@ -21,7 +21,7 @@
   "permissions": {
     "network": ["unipus.cn", "*.unipus.cn", "*.myqcloud.com"],
     "browser": true,
-    "ai": false,
+    "ai": true,
     "storage": "module"
   }
 }

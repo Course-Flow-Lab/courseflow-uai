@@ -10,9 +10,9 @@
 | `auth.begin` / `auth.submit` / `auth.poll` / `auth.complete` | ✅ 真实 CAS 账号密码登录 |
 | `auth.verify` / `auth.keepalive` | ✅ 基础实现 |
 | `catalog.courses` | ✅ 配置课程（`course_id` / `course_name`） |
-| `catalog.units` | ✅ 真实课程树，视频 / 阅读叶子 + 进度回读 |
-| `study.step` | ✅ 视频/阅读 `finishNode` + `course_progress` 回读 |
-| `exam.*` / `activity.step` / 章节题目 | ❌ 未实现 |
+| `catalog.units` | ✅ 真实课程树：视频 / 阅读 / 题目活动，带进度回读 |
+| `study.step` | ✅ 视频/阅读 `finishNode`；客观题 `cw.ai.generate` + `submitScore` + `answer/list` 回读 |
+| `exam.*` / Unit Test / 挑战卷 | ❌ 未实现 |
 | `oral` / 上传 / 讨论 | ❌ 未实现 |
 
 ## 登录模式
@@ -119,15 +119,16 @@ npm run build   # esbuild → index.mjs
 
 ## 已知限制
 
-- `live` 的 CAS 登录、浏览器内 reader token 已实测通过。
-- 视频/阅读的课程树、`finishNode`、`course_progress` 回读已接入，但**还需要用真实账号做一次验收**。
-- 如果章节接口也被 WAF 403，需要把相关调用迁到 `cw.browser.evaluate`；目前仍走 `cw.net.fetch`。
-- 章节题目、Unit Test、挑战卷、上传、口语尚未实现。
+- `live` 的 CAS 登录、浏览器内 reader token、课程树、视频完成已实测通过。
+- 章节题目已接入：`catalog.units` 会列出题目活动，客观题走 `cw.ai.generate` → `submitScore` → `answer/list`。
+- **章节题目需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
+- 主观题（writing / translation / oral / short_answer）目前返回 `needs_human`，尚未接入 judge 链路。
+- Unit Test、挑战卷、上传、口语尚未实现。
 - 北京时间 23:00–07:00 框架会暂停写操作；本地测试可临时设置 `CF_QUIET_HOURS_DISABLED_UNTIL`。
 
 ## 下一步
 
-1. 用真实账号验收 `catalog.units` + 视频/阅读 `study.step`。
-2. 迁移章节题目（解析、LLM、`submitScore`、判分）。
+1. 在 Courseflow 中配置模型，验收章节客观题提交。
+2. 接入主观题 judgeStart / judgeResult / submitScore。
 3. 迁移 Unit Test / 挑战卷到 `exam.*`。
 4. 上传、口语（口语优先走 `cw.browser` 或返回 `needs_human`）。
