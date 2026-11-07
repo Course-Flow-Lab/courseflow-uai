@@ -3654,6 +3654,12 @@ async function submitUnitTest(fetcher, auth, paperData, answers, meta) {
     }
   );
   const json = await response.json();
+  if (json.code === 417) {
+    throw {
+      code: "verification_required",
+      message: "\u4EA4\u5377\u88AB\u5E73\u53F0\u98CE\u63A7\uFF08417\uFF09\u3002\u8349\u7A3F\u5DF2\u4FDD\u5B58\uFF0C\u8BF7\u6253\u5F00\u5B98\u65B9 Unit Test \u9875\u9762\u624B\u52A8\u70B9\u51FB\u4EA4\u5377\u3002"
+    };
+  }
   if (json.code !== 200) throw new Error(`submitUserPaperAnswer failed: ${json.message ?? `code ${json.code}`}`);
   log("info", `exam unit_test submit code=${json.code}`);
 }
@@ -3869,6 +3875,12 @@ async function examWrite(params) {
       "info",
       `exam challenge answer code=${answer.code ?? "?"} message=${String(answer.message ?? "").slice(0, 120)}`
     );
+    if (answer.code === 417) {
+      throw {
+        code: "verification_required",
+        message: "\u4EA4\u5377\u88AB\u5E73\u53F0\u98CE\u63A7\uFF08417\uFF09\u3002\u7B54\u6848\u5DF2\u4FDD\u5B58\uFF0C\u8BF7\u6253\u5F00\u5B98\u65B9\u6311\u6218\u5377\u9875\u9762\u624B\u52A8\u70B9\u51FB\u4EA4\u5377\u3002"
+      };
+    }
     if (answer.code !== 0 && answer.code !== 200) {
       throw new Error(`submitUserPaperAnswer failed: ${answer.message ?? `code ${answer.code}`}`);
     }

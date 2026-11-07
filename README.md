@@ -132,6 +132,7 @@ npm run build   # esbuild → index.mjs
 - 提交护栏：按“题组 + 版本 + 答案”做 ledger 去重；两次提交至少间隔 2.5 秒、每分钟最多 20 次；408/429/5xx 自动退避重试。
 - 某个题组确认无法自动到 100 时会记入 `blocked`，后续任务直接暂停提示，不会反复重交。
 - 连线题协议提交仍不完整时，会尝试打开官方章节页，用 CDP 真实鼠标拖拽 React Flow 节点作为兜底；失败才转人工。
+- Unit Test / 挑战卷交卷遇到 417 风控时会明确提示“草稿已保存，请到官方页面手动交卷”。
 - 框架支持 `CF_HTTP_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`，模块的 HTTP 请求和官方 Chromium 都会走该代理。
 - 题目活动完成后会写入模块状态，`catalog.units` 里的 `q::` 活动会显示 `completed`，后续 job 不再重做。
 - 试卷会先查最新实例：未交卷的续答，已交卷的跳过；`exam.redo` 才会新建实例。

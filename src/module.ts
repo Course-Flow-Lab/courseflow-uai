@@ -2257,6 +2257,12 @@ async function submitUnitTest(fetcher: any, auth: any, paperData: any, answers: 
     },
   );
   const json = await response.json();
+  if (json.code === 417) {
+    throw {
+      code: 'verification_required',
+      message: '交卷被平台风控（417）。草稿已保存，请打开官方 Unit Test 页面手动点击交卷。',
+    };
+  }
   if (json.code !== 200) throw new Error(`submitUserPaperAnswer failed: ${json.message ?? `code ${json.code}`}`);
   log('info', `exam unit_test submit code=${json.code}`);
 }
@@ -2503,6 +2509,12 @@ async function examWrite(params: any) {
       'info',
       `exam challenge answer code=${answer.code ?? '?'} message=${String(answer.message ?? '').slice(0, 120)}`,
     );
+    if (answer.code === 417) {
+      throw {
+        code: 'verification_required',
+        message: '交卷被平台风控（417）。答案已保存，请打开官方挑战卷页面手动点击交卷。',
+      };
+    }
     if (answer.code !== 0 && answer.code !== 200) {
       throw new Error(`submitUserPaperAnswer failed: ${answer.message ?? `code ${answer.code}`}`);
     }
