@@ -1,0 +1,12 @@
+{
+  "name": "courseflow-unipus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Courseflow U校园平台模块（骨架）",
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node index.mjs"
+  }
+}

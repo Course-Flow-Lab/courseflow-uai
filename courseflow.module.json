@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "unipus",
+  "name": "U校园（骨架）",
+  "version": "0.1.0",
+  "moduleApi": 1,
+  "engines": { "framework": ">=0.1.1 <0.2.0" },
+  "runtime": { "engine": "node", "entry": "index.mjs", "files": [] },
+  "platform": {
+    "id": "unipus",
+    "name": "U校园（骨架）",
+    "short": "U校园",
+    "login": ["password"],
+    "operations": ["study", "trial"],
+    "unit_kinds": ["video", "reading", "document"],
+    "presentation": {
+      "tabs": [{ "id": "study", "label": "学习目录" }],
+      "actions": []
+    }
+  },
+  "permissions": {
+    "network": ["unipus.cn", "*.unipus.cn", "*.myqcloud.com"],
+    "browser": true,
+    "ai": false,
+    "storage": "module"
+  }
+}
