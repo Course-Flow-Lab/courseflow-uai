@@ -126,6 +126,12 @@ npm run build   # esbuild → index.mjs
 - Unit Test 1–8 题型完全一致：**21 × single_choice + 4 × fill_blanks_choice + 1 × translation**，共 26 题。
 - 8 个 Unit Test 中**没有 matching、writing、short_answer、discussion、upload、speaking** 等特殊题型。
 - `matching`（`text_match` / 连线）只出现在章节活动里，Unit Test 里没有；当前模块的章节题目链路已能处理 `text_match` 的选项编码。
+- **章节客观题按 100 分判定通过**：提交后回读 `answer/list`，未到 100 分时用平台标准答案自动重交一次；仍不到 100 会暂停并提示人工检查。
+- 平台只存储但不评分的长文本填空题（`status: 0`、`score: null`）按“已作答”通过，否则会永远卡在 0 分；能自动评分的单选/判断/选词/连线/普通填空必须到 100。
+- 已满分（100）的题组会跳过，不重复调用模型、不重复提交。
+- 题目活动完成后会写入模块状态，`catalog.units` 里的 `q::` 活动会显示 `completed`，后续 job 不再重做。
+- 试卷会先查最新实例：未交卷的续答，已交卷的跳过；`exam.redo` 才会新建实例。
+- `catalog.papers` 会回读 `done` / `score`，Unit Test 和挑战卷都能显示实际状态。
 - **章节题目和考试都需要先在 Courseflow「模型与任务设置」中选择一个模型**；未配置时任务会暂停并提示。
 - 上传已实测：Unit 7 多媒体上传 → COS PUT 200 → `submitScore` 200 → `unit_completed`。
 - 口语已实测：AI 生成 30–45 词答案 → 百度 TTS → 浏览器内转 16 kHz WAV → SOE WebSocket 评测（81 分）→ COS 上传 → 回读平台评测 → `submitScore` 200。
@@ -138,6 +144,8 @@ npm run build   # esbuild → index.mjs
 
 ## 下一步
 
-1. 继续覆盖其他 Unit Test 的 matching / 特殊题型。
-2. 讨论题。
-3. 让口语 TTS 引擎可配置，并评估更稳定的语音源。
+1. 提交去重 ledger、客户端限速和 408/429/5xx 自动重试。
+2. Token 自动续期（剩余不足 6 小时自动重新登录）。
+3. 共享答案库（跨账号/跨部署 import/export/pull/push）。
+4. 考试回读 `graded_answers` / `review`，支持逐题正确答案复盘。
+5. 讨论题和口语低分重试（`improve`）。

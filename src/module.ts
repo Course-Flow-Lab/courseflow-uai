@@ -38,7 +38,7 @@ import {
   buildPaperSavePayload,
   buildPaperSubmitPayload,
 } from './vendor/paper-api.js';
-import { parsePaperData } from './vendor/paper.js';
+import { lexicalText, parsePaperData } from './vendor/paper.js';
 import {
   collectQuizLinks,
   createChallengeInstance,
@@ -752,6 +752,179 @@ async function readCachedAnswers(session: string, key: string): Promise<any[] | 
   }
 }
 
+const AI_GRADED_TYPES = new Set([
+  'writing',
+  'translation',
+  'short_answer',
+  'oral_personal_state',
+]);
+
+const OBJECTIVE_TYPES = new Set([
+  'single_choice',
+  'multiple_choice',
+  'true_false',
+  'fill_blanks_choice',
+  'fill_blanks',
+  'text_match',
+  'matching',
+  'single',
+  'multiple',
+  'judge',
+]);
+
+function toPlainAnswer(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{')) return value;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === 'object' && 'root' in parsed) {
+      const text = lexicalText(parsed).trim();
+      return text || value;
+    }
+  } catch {
+    // not Lexical JSON
+  }
+  return value;
+}
+
+interface GroupState {
+  data: any;
+  score?: number;
+  nonEmpty: number;
+  hasKey: boolean;
+  objective: boolean;
+  maxScore: number;
+  ungraded: boolean;
+  complete: boolean;
+}
+
+/**
+ * Read one question group's platform state.
+ *
+ * Objective groups (single/multiple/judge/fill/blanks/matching) only count as
+ * passed at 100 points, matching unicheat. Subjective/oral/upload/discussion
+ * groups count as passed once the platform stores a grade or a non-empty answer.
+ */
+async function readGroupState(
+  auth: any,
+  fetcher: any,
+  groupId: string,
+  version: string,
+  questions: any[],
+): Promise<GroupState> {
+  if (!groupId || !version) {
+    return {
+      data: null,
+      nonEmpty: 0,
+      hasKey: false,
+      objective: false,
+      maxScore: 0,
+      ungraded: false,
+      complete: false,
+    };
+  }
+  const result = await fetchChapterAnswerList(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    groupId,
+    version,
+    fetcher,
+  );
+  const data = result.data ?? {};
+  const children = Array.isArray(data.userAnswersResult) ? data.userAnswersResult : [];
+  const nonEmpty = children.filter(
+    (child: any) =>
+      typeof child.userAnswerValue === 'string' && child.userAnswerValue.length > 0,
+  ).length;
+  const keyed = (Array.isArray(data.correctAnswers) ? data.correctAnswers : []).filter(
+    (item: any) =>
+      Array.isArray(item.answers) &&
+      item.answers.some(
+        (answer: any) =>
+          typeof answer.answerValue === 'string' && answer.answerValue.length > 0,
+      ),
+  );
+  const types = questions
+    .map((question) => String(question.rawType ?? question.type ?? ''))
+    .filter(Boolean);
+  const objective = types.length > 0
+    ? types.every((type) => OBJECTIVE_TYPES.has(type))
+    : keyed.length > 0;
+  const score = typeof data.score === 'number' ? data.score : undefined;
+  const maxScore = questions.reduce(
+    (sum, question) => sum + (Number(question.score) || 0),
+    0,
+  );
+  const ungraded =
+    children.length > 0 &&
+    children.every(
+      (child: any) => (child.status ?? 0) === 0 && child.score === null,
+    );
+  // Auto-graded objective groups must reach 100. Long free-text fill groups
+  // that the platform stores but never grades (`status: 0`) are accepted once
+  // an answer is stored; otherwise they would block forever.
+  const strict = objective && !ungraded;
+  const complete = strict
+    ? score === 100 || (maxScore === 0 && nonEmpty > 0)
+    : score !== undefined || nonEmpty > 0;
+  return {
+    data,
+    ...(score !== undefined ? { score } : {}),
+    nonEmpty,
+    hasKey: keyed.length > 0,
+    objective,
+    maxScore,
+    ungraded,
+    complete,
+  };
+}
+
+/** True when submitScore stored the text but never graded it. */
+function isUngraded(state: GroupState): boolean {
+  return state.ungraded;
+}
+
+/** Rewrite a submission with the platform's own answer key. */
+function applyPlatformAnswers(submission: any, state: GroupState): any | null {
+  const byChild = new Map<string, string>();
+  for (const item of state.data?.correctAnswers ?? []) {
+    if (!item?.childId) continue;
+    const value = (item.answers ?? []).find(
+      (answer: any) => typeof answer.answerValue === 'string' && answer.answerValue,
+    )?.answerValue;
+    if (value) byChild.set(String(item.childId), String(value));
+  }
+  if (byChild.size === 0) return null;
+
+  let changed = false;
+  const userAnswers = submission.userAnswers.map((record: any) => {
+    if (AI_GRADED_TYPES.has(String(record.questionType ?? ''))) return record;
+    const key = byChild.get(String(record.childId));
+    if (!key) return record;
+    const value = toPlainAnswer(key);
+    if (value === record.userAnswerValue) return record;
+    changed = true;
+    return { ...record, userAnswerValue: value };
+  });
+  return changed ? { ...submission, userAnswers } : null;
+}
+
+async function readActivityState(session: string, key: string): Promise<any | null> {
+  try {
+    const stored = await hostCall('cw.state', { session, namespace: 'activity', key });
+    return (stored as any)?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveActivityState(session: string, key: string, value: any): Promise<void> {
+  try {
+    await hostCall('cw.state', { session, namespace: 'activity', key, value });
+  } catch {
+    // state is an optimization; never fail the step for it
+  }
+}
+
 async function solveQuestions(session: string, activity: any): Promise<any[]> {
   const payload = (activity.questions ?? [])
     .filter((question: any) => !isOralQuestion(question))
@@ -1141,6 +1314,61 @@ async function studyQuestionStep(
     }),
   };
 
+  const groupVersionOf = (group: any): string =>
+    String(
+      group.versionNumber ??
+        activity.questions.find((question: any) => question.groupId === group.groupId)
+          ?.groupVersion ??
+        '',
+    );
+  const questionsOfGroup = (groupId: string): any[] =>
+    (activity.questions ?? []).filter(
+      (question: any) => String(question.groupId ?? '') === groupId,
+    );
+  const groups = (activity.questionGroups ?? []).filter(
+    (group: any) => Boolean(group?.groupId),
+  );
+  const allComplete = (states: GroupState[]): boolean =>
+    states.length > 0 && states.every((state) => state.complete);
+
+  const saved = await readActivityState(session, rawId);
+  if (saved?.completed === true && params.checkpoint?.phase !== 'submitted') {
+    return {
+      status: 'completed',
+      evidence: { ...saved, cached: true },
+      checkpoint: { phase: 'done' },
+    };
+  }
+
+  // Read every group first: objective groups only count as passed at 100.
+  const preStates = new Map<string, GroupState>();
+  for (const group of groups) {
+    const groupId = String(group.groupId);
+    preStates.set(
+      groupId,
+      await readGroupState(
+        auth,
+        fetcher,
+        groupId,
+        groupVersionOf(group),
+        questionsOfGroup(groupId),
+      ),
+    );
+  }
+  const observedStates = new Map(preStates);
+
+  if (params.checkpoint?.phase !== 'submitted' && allComplete([...preStates.values()])) {
+    const scores = [...preStates.values()].map((state) => state.score ?? null);
+    const evidence = {
+      platform_confirmed: true,
+      groups: preStates.size,
+      scores,
+      total: scores.reduce<number>((sum, score) => sum + (score ?? 0), 0),
+    };
+    await saveActivityState(session, rawId, { completed: true, at: Date.now(), ...evidence });
+    return { status: 'completed', evidence, checkpoint: { phase: 'done' } };
+  }
+
   if (params.checkpoint?.phase !== 'submitted') {
     const oralQuestions = (activity.questions ?? []).filter(isOralQuestion);
     if (oralQuestions.length > 0) {
@@ -1149,16 +1377,8 @@ async function studyQuestionStep(
       const done = Math.max(0, Number(params.checkpoint?.oral_index ?? 0));
       if (done < oralQuestions.length) {
         const question = oralQuestions[done];
-        const existing = await fetchChapterAnswerList(
-          { token: auth.token, baseUrl: IPUB_BASE },
-          String(question.groupId ?? ''),
-          String(question.groupVersion ?? ''),
-          fetcher,
-        );
         const already = Boolean(
-          existing.data &&
-            (existing.data.score !== undefined ||
-              (existing.data.userAnswersResult?.length ?? 0) > 0),
+          preStates.get(String(question.groupId ?? ''))?.complete,
         );
         if (!already) {
           const page = await openOfficialPage(session, meta.referer);
@@ -1168,11 +1388,7 @@ async function studyQuestionStep(
             await hostCall('cw.browser.close', { session, page, stage: 'read' }).catch(() => {});
           }
         } else {
-          log(
-            'info',
-            `oral ${String(question.id)} already answered; skipped ` +
-              `score=${existing.data?.score ?? 'null'} answers=${existing.data?.userAnswersResult?.length ?? 0}`,
-          );
+          log('info', `oral ${String(question.id)} already answered; skipped`);
         }
         return {
           status: 'in_progress',
@@ -1183,77 +1399,222 @@ async function studyQuestionStep(
       }
     }
 
-    let answers = await readCachedAnswers(session, rawId);
-    if (!answers) {
-      answers = await solveQuestions(session, activity);
-      await hostCall('cw.state', {
-        session,
-        namespace: 'answers',
-        key: rawId,
-        value: answers,
-      });
-    }
-    const { submissions, warnings } = buildChapterSubmissions(activity.questions, answers);
-    if (warnings.length > 0) log('warn', `chapter warnings: ${warnings.join('; ')}`);
-    for (const submission of submissions) {
+    const pendingGroups = groups.filter(
+      (group: any) => !preStates.get(String(group.groupId))?.complete,
+    );
+
+    // One group per step: judge escalation (judgeStart -> poll -> judgeResult)
+    // can take >20s, and the framework aborts a module call after 30s.
+    if (pendingGroups.length > 0) {
+      const group = pendingGroups[0];
+      const groupId = String(group.groupId);
+      const pendingQuestions = questionsOfGroup(groupId);
+      let answers = await readCachedAnswers(session, rawId);
+      if (!answers) {
+        answers = await solveQuestions(session, { ...activity, questions: pendingQuestions });
+        await hostCall('cw.state', {
+          session,
+          namespace: 'answers',
+          key: rawId,
+          value: answers,
+        });
+      }
+      const { submissions, warnings } = buildChapterSubmissions(pendingQuestions, answers);
+      if (warnings.length > 0) log('warn', `chapter warnings: ${warnings.join('; ')}`);
+      if (submissions.length === 0) {
+        return {
+          status: 'needs_human',
+          reason: `题组 ${groupId} 没有生成可提交的答案，需要人工检查`,
+        };
+      }
+
+      const submission = submissions[0];
+      const questions = pendingQuestions;
       if (submission.mode === 'judge') {
         const outcome = await submitChapterJudge(
           { token: auth.token, baseUrl: IPUB_BASE },
           meta,
           submission,
-          { fetcher, maxAttempts: 2, pollIntervalMs: 1000 },
+          { fetcher, maxAttempts: 8, pollIntervalMs: 1200 },
         );
         log(
           'info',
-          `judge ${submission.groupId} polls=${outcome.polls} score=${outcome.score ?? 'pending'}` +
+          `judge ${groupId} polls=${outcome.polls} score=${outcome.score ?? 'pending'}` +
             (outcome.warnings.length > 0 ? ` warnings=${outcome.warnings.join('; ')}` : ''),
         );
         if (!outcome.responses.score?.ok) {
-          log('warn', `judge submitScore not ok for ${submission.groupId}`);
+          log('warn', `judge submitScore not ok for ${groupId}`);
         }
-        continue;
+        observedStates.set(
+          groupId,
+          await readGroupState(auth, fetcher, groupId, submission.versionNumber, questions),
+        );
+      } else {
+        const result = await submitChapterScore(
+          { token: auth.token, baseUrl: IPUB_BASE },
+          meta,
+          submission,
+          fetcher,
+        );
+        log(
+          'info',
+          `submitScore ${groupId} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
+        );
+        if (!result.ok) throw new Error(`submitScore failed: HTTP ${result.status}`);
+
+        let state = await readGroupState(
+          auth,
+          fetcher,
+          groupId,
+          submission.versionNumber,
+          questions,
+        );
+        observedStates.set(groupId, state);
+        let effective = submission;
+
+        // Long free-text fills are stored without grading (`status: 0`).
+        // unicheat escalates these through judgeStart instead of resubmitting
+        // the same text via submitScore.
+        if (state.maxScore > 0 && isUngraded(state)) {
+          if (state.hasKey) {
+            const corrected = applyPlatformAnswers(submission, state);
+            if (corrected) effective = corrected;
+          }
+          log('info', `escalate ${groupId}: ungraded, retrying via judgeStart`);
+          const outcome = await submitChapterJudge(
+            { token: auth.token, baseUrl: IPUB_BASE },
+            meta,
+            { ...effective, mode: 'judge' },
+            {
+              fetcher,
+              extraQuestionTypes: ['fill_blanks'],
+              maxAttempts: 10,
+              pollIntervalMs: 1200,
+            },
+          );
+          log(
+            'info',
+            `escalated ${groupId} score=${outcome.score ?? 'pending'} polls=${outcome.polls}` +
+              (outcome.warnings.length > 0 ? ` warnings=${outcome.warnings.join('; ')}` : ''),
+          );
+          state = await readGroupState(
+            auth,
+            fetcher,
+            groupId,
+            submission.versionNumber,
+            questions,
+          );
+          observedStates.set(groupId, state);
+        } else if (state.objective && state.hasKey && state.score !== 100) {
+          const corrected = applyPlatformAnswers(submission, state);
+          if (!corrected) {
+            log('warn', `correct ${groupId}: platform key could not be applied`);
+          } else {
+            effective = corrected;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            const correctedResult = await submitChapterScore(
+              { token: auth.token, baseUrl: IPUB_BASE },
+              meta,
+              corrected,
+              fetcher,
+            );
+            log(
+              'info',
+              `correct ${groupId} score=${state.score ?? '?'} -> answer key HTTP ${correctedResult.status}`,
+            );
+            if (correctedResult.ok) {
+              state = await readGroupState(
+                auth,
+                fetcher,
+                groupId,
+                submission.versionNumber,
+                questions,
+              );
+              observedStates.set(groupId, state);
+              log('info', `corrected ${groupId} score=${state.score ?? '?'}`);
+            } else {
+              log('warn', `correct ${groupId} failed: HTTP ${correctedResult.status}`);
+            }
+          }
+        }
       }
-      const result = await submitChapterScore(
-        { token: auth.token, baseUrl: IPUB_BASE },
-        meta,
-        submission,
-        fetcher,
-      );
-      log(
-        'info',
-        `submitScore ${submission.groupId} HTTP ${result.status} code ${(result.json as any)?.code ?? '?'}`,
-      );
-      if (!result.ok) throw new Error(`submitScore failed: HTTP ${result.status}`);
+
+      const post = observedStates.get(groupId);
+      if (!post?.complete) {
+        const reason = post?.objective
+          ? `题组 ${groupId} 客观题未达到 100 分（当前 ${post?.score ?? '无分数'}）`
+          : `题组 ${groupId} 尚未完成（平台未返回成绩）`;
+        return { status: 'needs_human', reason };
+      }
+
+      const doneGroups = groups.filter(
+        (item: any) => observedStates.get(String(item.groupId))?.complete,
+      ).length;
+      return {
+        status: 'in_progress',
+        progress: { groups_done: doneGroups, groups_total: groups.length },
+        wait_ms: 500,
+        checkpoint: { phase: 'groups', oral_index: oralQuestions.length },
+      };
     }
   }
 
-  const checks: boolean[] = [];
-  for (const group of activity.questionGroups ?? []) {
-    const version =
-      group.versionNumber ??
-      activity.questions.find((question: any) => question.groupId === group.groupId)?.groupVersion ??
-      '';
-    const result = await fetchChapterAnswerList(
-      { token: auth.token, baseUrl: IPUB_BASE },
-      group.groupId,
-      version,
-      fetcher,
+  const finalStates: GroupState[] = [];
+  for (const group of groups) {
+    finalStates.push(
+      observedStates.get(String(group.groupId)) ?? {
+        data: null,
+        nonEmpty: 0,
+        hasKey: false,
+        objective: false,
+        maxScore: 0,
+        ungraded: false,
+        complete: false,
+      },
     );
-    const answered = Boolean(
-      result.data &&
-        (result.data.score !== undefined ||
-          (result.data.userAnswersResult?.length ?? 0) > 0),
-    );
-    checks.push(answered);
   }
-  if (checks.length > 0 && checks.every(Boolean)) {
+
+  if (allComplete(finalStates)) {
+    const scores = finalStates.map((state) => state.score ?? null);
+    const evidence = {
+      platform_confirmed: true,
+      groups: finalStates.length,
+      scores,
+      total: scores.reduce<number>((sum, score) => sum + (score ?? 0), 0),
+    };
+    await saveActivityState(session, rawId, { completed: true, at: Date.now(), ...evidence });
+    return { status: 'completed', evidence, checkpoint: { phase: 'done' } };
+  }
+
+  const low = finalStates
+    .map((state, index) => ({ state, group: groups[index] }))
+    .filter(
+      ({ state }) =>
+        state.objective && typeof state.score === 'number' && state.score < 100,
+    );
+  if (low.length > 0) {
+    const detail = low
+      .map(({ state, group }) => `${group.groupId}:${state.score}`)
+      .join(', ');
+    log('warn', `objective groups below 100: ${detail}`);
     return {
-      status: 'completed',
-      evidence: { platform_confirmed: true, groups: checks.length },
-      checkpoint: { phase: 'done' },
+      status: 'needs_human',
+      reason: `客观题未达到 100 分（${detail}），需要人工检查`,
     };
   }
-  return { status: 'in_progress', wait_ms: 2000, checkpoint: { phase: 'submitted' } };
+
+  const readback = Number(params.checkpoint?.readback ?? 0) + 1;
+  if (readback >= 3) {
+    return {
+      status: 'needs_human',
+      reason: '平台尚未返回全部题组的分数，请到官方页面核对',
+    };
+  }
+  return {
+    status: 'in_progress',
+    wait_ms: 2000,
+    checkpoint: { phase: 'submitted', readback },
+  };
 }
 
 const paperCache = new Map<string, any>();
@@ -1373,19 +1734,31 @@ async function catalogPapers(params: any) {
   const auth = await readAuth(session);
   const fetcher: any = hostFetchFor(session);
   await refreshPapers(session, cfg, auth, fetcher);
+  const metas = [...paperCache.values()];
+  const statuses = new Map<string, { done: boolean; score: number | null }>();
+  for (let index = 0; index < metas.length; index += 4) {
+    const chunk = metas.slice(index, index + 4);
+    const results = await Promise.all(
+      chunk.map((meta) => readPaperStatus(fetcher, auth, meta).catch(() => ({ done: false, score: null }))),
+    );
+    chunk.forEach((meta, offset) => statuses.set(meta.paperId, results[offset]!));
+  }
   return {
-    papers: [...paperCache.values()].map((meta) => ({
-      id: meta.paperId,
-      name: meta.paperName,
-      category: meta.paperType === 3 ? 'unit_test' : 'challenge',
-      available: true,
-      done: false,
-      can_redo: true,
-      can_review: true,
-      score: null,
-      attempts_left: null,
-      ends_at: null,
-    })),
+    papers: metas.map((meta) => {
+      const status = statuses.get(meta.paperId) ?? { done: false, score: null };
+      return {
+        id: meta.paperId,
+        name: meta.paperName,
+        category: meta.paperType === 3 ? 'unit_test' : 'challenge',
+        available: true,
+        done: status.done,
+        can_redo: true,
+        can_review: true,
+        score: status.score,
+        attempts_left: null,
+        ends_at: null,
+      };
+    }),
   };
 }
 
@@ -1522,6 +1895,74 @@ async function readPaperScore(fetcher: any, auth: any, paperData: any) {
   return json?.data ?? {};
 }
 
+const paperStatusCache = new Map<
+  string,
+  { done: boolean; score: number | null; at: number }
+>();
+
+function paperStatusKey(meta: any): string {
+  return `${meta.bookId}:${meta.paperId}:${meta.paperType}`;
+}
+
+/** Latest attempt for a paper (`POST /paper/instance/getLatestPaperInstance`). */
+async function fetchLatestPaper(
+  fetcher: any,
+  auth: any,
+  meta: any,
+): Promise<any | null> {
+  const response = await fetcher(
+    `${IPUB_BASE}/api/reader/paper/instance/getLatestPaperInstance`,
+    {
+      method: 'POST',
+      headers: { ...baseHeaders(auth.token), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        bookId: meta.bookId,
+        bookVersionNumber: meta.bookVersion,
+        paperId: meta.paperId,
+        versionNumber: meta.versionNumber,
+        paperType: meta.paperType ?? 3,
+        testMode: 1,
+      }),
+    },
+  );
+  const json = await response.json().catch(() => null);
+  return json?.code === 200 && json.data ? json.data : null;
+}
+
+/** Submitted/score state for one paper; submitted (`status === 1`) is sticky. */
+async function readPaperStatus(
+  fetcher: any,
+  auth: any,
+  meta: any,
+): Promise<{ done: boolean; score: number | null }> {
+  const key = paperStatusKey(meta);
+  const cached = paperStatusCache.get(key);
+  if (cached && (cached.done || Date.now() - cached.at < 20_000)) {
+    return { done: cached.done, score: cached.score };
+  }
+  let value: { done: boolean; score: number | null } = { done: false, score: null };
+  try {
+    const latest = await fetchLatestPaper(fetcher, auth, meta);
+    if (latest?.instanceId) {
+      const paperData = {
+        ...parsePaperData(latest),
+        paperId: meta.paperId,
+        versionNumber: meta.versionNumber || latest.versionNumber,
+        paperType: meta.paperType,
+      };
+      const score = await readPaperScore(fetcher, auth, paperData);
+      value = {
+        done: score.status === 1,
+        score: score.paperScore?.userScore ?? score.totalScore ?? null,
+      };
+    }
+  } catch (error) {
+    log('warn', `paper status ${meta.paperId} failed: ${errorText(error)}`);
+  }
+  paperStatusCache.set(key, { ...value, at: Date.now() });
+  return value;
+}
+
 async function examOpen(params: any) {
   const session = String(params.session ?? '');
   const cfg = courseConfig();
@@ -1536,16 +1977,47 @@ async function examOpen(params: any) {
   }
   if (!meta) throw { code: 'not_found', message: '试卷不存在' };
 
+  const forceNew = params.force_new === true;
+  const statusKey = paperStatusKey(meta);
   let paperData: any;
-  if (meta.paperType === 2) {
-    const instance = await createChallengeInstance(
-      { token: auth.token, baseUrl: IPUB_BASE },
-      { bookId: cfg.bookId, bookVersionNumber: cfg.bookVersion, paperId: meta.paperId },
-      fetcher,
-    );
-    paperData = parsePaperData(instance);
-  } else {
-    paperData = await createUnitTestInstance(fetcher, auth, cfg, meta);
+  if (!forceNew) {
+    const latest = await fetchLatestPaper(fetcher, auth, meta);
+    if (latest?.instanceId) {
+      const candidate = {
+        ...parsePaperData(latest),
+        paperId: meta.paperId,
+        versionNumber: meta.versionNumber || latest.versionNumber,
+        paperType: meta.paperType,
+      };
+      const score = await readPaperScore(fetcher, auth, candidate);
+      if (score.status === 1) {
+        paperStatusCache.set(statusKey, {
+          done: true,
+          score: score.paperScore?.userScore ?? score.totalScore ?? null,
+          at: Date.now(),
+        });
+        throw {
+          code: 'already_submitted',
+          message: '该试卷已交卷；如需重新作答，请使用“重做”',
+        };
+      }
+      paperData = candidate;
+      log('info', `exam resume ${meta.paperId} instance=${candidate.instanceId}`);
+    }
+  }
+  if (forceNew) paperStatusCache.delete(statusKey);
+
+  if (!paperData) {
+    if (meta.paperType === 2) {
+      const instance = await createChallengeInstance(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        { bookId: cfg.bookId, bookVersionNumber: cfg.bookVersion, paperId: meta.paperId },
+        fetcher,
+      );
+      paperData = parsePaperData(instance);
+    } else {
+      paperData = await createUnitTestInstance(fetcher, auth, cfg, meta);
+    }
   }
   if (!paperData.instanceId) throw new Error('试卷实例缺少 instanceId');
   log(
@@ -1704,14 +2176,22 @@ async function examReadback(params: any) {
   const state = (stored as any)?.value;
   if (!state?.paperData) throw { code: 'not_found', message: '试卷实例不存在' };
   const score = await readPaperScore(fetcher, auth, state.paperData);
+  const userScore = score.paperScore?.userScore ?? score.totalScore ?? null;
+  if (score.status === 1) {
+    paperStatusCache.set(paperStatusKey(state.meta), {
+      done: true,
+      score: userScore,
+      at: Date.now(),
+    });
+  }
   log(
     'info',
-    `exam readback status=${score.status ?? '?'} score=${score.paperScore?.userScore ?? score.totalScore ?? '?'}`,
+    `exam readback status=${score.status ?? '?'} score=${userScore ?? '?'}`,
   );
   return {
     confirmed: score.status === 1,
     attempt_id: attemptId,
-    score: score.paperScore?.userScore ?? score.totalScore ?? null,
+    score: userScore,
     graded_answers: [],
     review: null,
   };
@@ -1910,19 +2390,24 @@ async function catalogUnits(params) {
       try {
         const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
         const activities = structure?.structure?.activities ?? [];
-        activities.forEach((activity: any, activityIndex: number) => {
-          if (!activity.questions?.length) return;
+        for (const [activityIndex, activity] of activities.entries()) {
+          if (!activity.questions?.length) continue;
           const groupTypes = (activity.questionGroups ?? [])
             .map((group: any) => String(group.groupType ?? ''))
             .filter(Boolean);
           // Upload groups have their own course-tree leaf; the synthetic
           // `unmapped` activity would otherwise submit an empty upload answer.
-          if (groupTypes.length > 0 && groupTypes.every((type) => /multi_media_upload/.test(type))) {
-            return;
+          if (
+            groupTypes.length > 0 &&
+            groupTypes.every((type: string) => /multi_media_upload/.test(type))
+          ) {
+            continue;
           }
-          const key = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
+          const activityKey = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
+          const id = `q::${chapterId}::${encodeURIComponent(activityKey)}::${activityIndex}`;
+          const saved = await readActivityState(session, id);
           units.push({
-            id: `q::${chapterId}::${encodeURIComponent(key)}::${activityIndex}`,
+            id,
             name: String(activity.title ?? `题目 ${activityIndex + 1}`).trim(),
             chapter_id: chapterId,
             chapter_name: chapterName,
@@ -1930,7 +2415,7 @@ async function catalogUnits(params) {
             kind: 'document',
             duration_seconds: 0,
             watched_seconds: 0,
-            state: 'not_started',
+            state: saved?.completed === true ? 'completed' : 'not_started',
             video_id: null,
             selectable: true,
             selectable_note: (activity.questionGroups ?? [])
@@ -1938,7 +2423,7 @@ async function catalogUnits(params) {
               .filter(Boolean)
               .join(','),
           });
-        });
+        }
       } catch (error) {
         log('warn', `chapter structure ${chapterId} failed: ${errorText(error)}`);
       }
@@ -2166,7 +2651,7 @@ async function dispatch(method, params) {
     case 'exam.review':
       return examReview(params);
     case 'exam.redo':
-      return examOpen(params);
+      return examOpen({ ...params, force_new: true });
     case 'exam.heartbeat':
       return { ok: true };
     case 'study.step':

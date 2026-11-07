@@ -2368,6 +2368,127 @@ async function readCachedAnswers(session, key) {
     return null;
   }
 }
+var AI_GRADED_TYPES = /* @__PURE__ */ new Set([
+  "writing",
+  "translation",
+  "short_answer",
+  "oral_personal_state"
+]);
+var OBJECTIVE_TYPES = /* @__PURE__ */ new Set([
+  "single_choice",
+  "multiple_choice",
+  "true_false",
+  "fill_blanks_choice",
+  "fill_blanks",
+  "text_match",
+  "matching",
+  "single",
+  "multiple",
+  "judge"
+]);
+function toPlainAnswer(value) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{")) return value;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && "root" in parsed) {
+      const text = lexicalText(parsed).trim();
+      return text || value;
+    }
+  } catch {
+  }
+  return value;
+}
+async function readGroupState(auth, fetcher, groupId, version, questions) {
+  if (!groupId || !version) {
+    return {
+      data: null,
+      nonEmpty: 0,
+      hasKey: false,
+      objective: false,
+      maxScore: 0,
+      ungraded: false,
+      complete: false
+    };
+  }
+  const result = await fetchChapterAnswerList(
+    { token: auth.token, baseUrl: IPUB_BASE },
+    groupId,
+    version,
+    fetcher
+  );
+  const data = result.data ?? {};
+  const children = Array.isArray(data.userAnswersResult) ? data.userAnswersResult : [];
+  const nonEmpty = children.filter(
+    (child) => typeof child.userAnswerValue === "string" && child.userAnswerValue.length > 0
+  ).length;
+  const keyed = (Array.isArray(data.correctAnswers) ? data.correctAnswers : []).filter(
+    (item) => Array.isArray(item.answers) && item.answers.some(
+      (answer) => typeof answer.answerValue === "string" && answer.answerValue.length > 0
+    )
+  );
+  const types = questions.map((question) => String(question.rawType ?? question.type ?? "")).filter(Boolean);
+  const objective = types.length > 0 ? types.every((type) => OBJECTIVE_TYPES.has(type)) : keyed.length > 0;
+  const score = typeof data.score === "number" ? data.score : void 0;
+  const maxScore = questions.reduce(
+    (sum, question) => sum + (Number(question.score) || 0),
+    0
+  );
+  const ungraded = children.length > 0 && children.every(
+    (child) => (child.status ?? 0) === 0 && child.score === null
+  );
+  const strict = objective && !ungraded;
+  const complete = strict ? score === 100 || maxScore === 0 && nonEmpty > 0 : score !== void 0 || nonEmpty > 0;
+  return {
+    data,
+    ...score !== void 0 ? { score } : {},
+    nonEmpty,
+    hasKey: keyed.length > 0,
+    objective,
+    maxScore,
+    ungraded,
+    complete
+  };
+}
+function isUngraded(state) {
+  return state.ungraded;
+}
+function applyPlatformAnswers(submission, state) {
+  const byChild = /* @__PURE__ */ new Map();
+  for (const item of state.data?.correctAnswers ?? []) {
+    if (!item?.childId) continue;
+    const value = (item.answers ?? []).find(
+      (answer) => typeof answer.answerValue === "string" && answer.answerValue
+    )?.answerValue;
+    if (value) byChild.set(String(item.childId), String(value));
+  }
+  if (byChild.size === 0) return null;
+  let changed = false;
+  const userAnswers = submission.userAnswers.map((record) => {
+    if (AI_GRADED_TYPES.has(String(record.questionType ?? ""))) return record;
+    const key = byChild.get(String(record.childId));
+    if (!key) return record;
+    const value = toPlainAnswer(key);
+    if (value === record.userAnswerValue) return record;
+    changed = true;
+    return { ...record, userAnswerValue: value };
+  });
+  return changed ? { ...submission, userAnswers } : null;
+}
+async function readActivityState(session, key) {
+  try {
+    const stored = await hostCall("cw.state", { session, namespace: "activity", key });
+    return stored?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+async function saveActivityState(session, key, value) {
+  try {
+    await hostCall("cw.state", { session, namespace: "activity", key, value });
+  } catch {
+  }
+}
 async function solveQuestions(session, activity) {
   const payload = (activity.questions ?? []).filter((question) => !isOralQuestion(question)).map((question) => ({
     id: question.id,
@@ -2704,20 +2825,58 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
       chapterId
     })
   };
+  const groupVersionOf = (group) => String(
+    group.versionNumber ?? activity.questions.find((question) => question.groupId === group.groupId)?.groupVersion ?? ""
+  );
+  const questionsOfGroup = (groupId) => (activity.questions ?? []).filter(
+    (question) => String(question.groupId ?? "") === groupId
+  );
+  const groups = (activity.questionGroups ?? []).filter(
+    (group) => Boolean(group?.groupId)
+  );
+  const allComplete = (states) => states.length > 0 && states.every((state) => state.complete);
+  const saved = await readActivityState(session, rawId);
+  if (saved?.completed === true && params.checkpoint?.phase !== "submitted") {
+    return {
+      status: "completed",
+      evidence: { ...saved, cached: true },
+      checkpoint: { phase: "done" }
+    };
+  }
+  const preStates = /* @__PURE__ */ new Map();
+  for (const group of groups) {
+    const groupId = String(group.groupId);
+    preStates.set(
+      groupId,
+      await readGroupState(
+        auth,
+        fetcher,
+        groupId,
+        groupVersionOf(group),
+        questionsOfGroup(groupId)
+      )
+    );
+  }
+  const observedStates = new Map(preStates);
+  if (params.checkpoint?.phase !== "submitted" && allComplete([...preStates.values()])) {
+    const scores = [...preStates.values()].map((state) => state.score ?? null);
+    const evidence = {
+      platform_confirmed: true,
+      groups: preStates.size,
+      scores,
+      total: scores.reduce((sum, score) => sum + (score ?? 0), 0)
+    };
+    await saveActivityState(session, rawId, { completed: true, at: Date.now(), ...evidence });
+    return { status: "completed", evidence, checkpoint: { phase: "done" } };
+  }
   if (params.checkpoint?.phase !== "submitted") {
     const oralQuestions = (activity.questions ?? []).filter(isOralQuestion);
     if (oralQuestions.length > 0) {
       const done = Math.max(0, Number(params.checkpoint?.oral_index ?? 0));
       if (done < oralQuestions.length) {
         const question = oralQuestions[done];
-        const existing = await fetchChapterAnswerList(
-          { token: auth.token, baseUrl: IPUB_BASE },
-          String(question.groupId ?? ""),
-          String(question.groupVersion ?? ""),
-          fetcher
-        );
         const already = Boolean(
-          existing.data && (existing.data.score !== void 0 || (existing.data.userAnswersResult?.length ?? 0) > 0)
+          preStates.get(String(question.groupId ?? ""))?.complete
         );
         if (!already) {
           const page = await openOfficialPage(session, meta.referer);
@@ -2728,10 +2887,7 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
             });
           }
         } else {
-          log(
-            "info",
-            `oral ${String(question.id)} already answered; skipped score=${existing.data?.score ?? "null"} answers=${existing.data?.userAnswersResult?.length ?? 0}`
-          );
+          log("info", `oral ${String(question.id)} already answered; skipped`);
         }
         return {
           status: "in_progress",
@@ -2741,70 +2897,198 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
         };
       }
     }
-    let answers = await readCachedAnswers(session, rawId);
-    if (!answers) {
-      answers = await solveQuestions(session, activity);
-      await hostCall("cw.state", {
-        session,
-        namespace: "answers",
-        key: rawId,
-        value: answers
-      });
-    }
-    const { submissions, warnings } = buildChapterSubmissions(activity.questions, answers);
-    if (warnings.length > 0) log("warn", `chapter warnings: ${warnings.join("; ")}`);
-    for (const submission of submissions) {
+    const pendingGroups = groups.filter(
+      (group) => !preStates.get(String(group.groupId))?.complete
+    );
+    if (pendingGroups.length > 0) {
+      const group = pendingGroups[0];
+      const groupId = String(group.groupId);
+      const pendingQuestions = questionsOfGroup(groupId);
+      let answers = await readCachedAnswers(session, rawId);
+      if (!answers) {
+        answers = await solveQuestions(session, { ...activity, questions: pendingQuestions });
+        await hostCall("cw.state", {
+          session,
+          namespace: "answers",
+          key: rawId,
+          value: answers
+        });
+      }
+      const { submissions, warnings } = buildChapterSubmissions(pendingQuestions, answers);
+      if (warnings.length > 0) log("warn", `chapter warnings: ${warnings.join("; ")}`);
+      if (submissions.length === 0) {
+        return {
+          status: "needs_human",
+          reason: `\u9898\u7EC4 ${groupId} \u6CA1\u6709\u751F\u6210\u53EF\u63D0\u4EA4\u7684\u7B54\u6848\uFF0C\u9700\u8981\u4EBA\u5DE5\u68C0\u67E5`
+        };
+      }
+      const submission = submissions[0];
+      const questions = pendingQuestions;
       if (submission.mode === "judge") {
         const outcome = await submitChapterJudge(
           { token: auth.token, baseUrl: IPUB_BASE },
           meta,
           submission,
-          { fetcher, maxAttempts: 2, pollIntervalMs: 1e3 }
+          { fetcher, maxAttempts: 8, pollIntervalMs: 1200 }
         );
         log(
           "info",
-          `judge ${submission.groupId} polls=${outcome.polls} score=${outcome.score ?? "pending"}` + (outcome.warnings.length > 0 ? ` warnings=${outcome.warnings.join("; ")}` : "")
+          `judge ${groupId} polls=${outcome.polls} score=${outcome.score ?? "pending"}` + (outcome.warnings.length > 0 ? ` warnings=${outcome.warnings.join("; ")}` : "")
         );
         if (!outcome.responses.score?.ok) {
-          log("warn", `judge submitScore not ok for ${submission.groupId}`);
+          log("warn", `judge submitScore not ok for ${groupId}`);
         }
-        continue;
+        observedStates.set(
+          groupId,
+          await readGroupState(auth, fetcher, groupId, submission.versionNumber, questions)
+        );
+      } else {
+        const result = await submitChapterScore(
+          { token: auth.token, baseUrl: IPUB_BASE },
+          meta,
+          submission,
+          fetcher
+        );
+        log(
+          "info",
+          `submitScore ${groupId} HTTP ${result.status} code ${result.json?.code ?? "?"}`
+        );
+        if (!result.ok) throw new Error(`submitScore failed: HTTP ${result.status}`);
+        let state = await readGroupState(
+          auth,
+          fetcher,
+          groupId,
+          submission.versionNumber,
+          questions
+        );
+        observedStates.set(groupId, state);
+        let effective = submission;
+        if (state.maxScore > 0 && isUngraded(state)) {
+          if (state.hasKey) {
+            const corrected = applyPlatformAnswers(submission, state);
+            if (corrected) effective = corrected;
+          }
+          log("info", `escalate ${groupId}: ungraded, retrying via judgeStart`);
+          const outcome = await submitChapterJudge(
+            { token: auth.token, baseUrl: IPUB_BASE },
+            meta,
+            { ...effective, mode: "judge" },
+            {
+              fetcher,
+              extraQuestionTypes: ["fill_blanks"],
+              maxAttempts: 10,
+              pollIntervalMs: 1200
+            }
+          );
+          log(
+            "info",
+            `escalated ${groupId} score=${outcome.score ?? "pending"} polls=${outcome.polls}` + (outcome.warnings.length > 0 ? ` warnings=${outcome.warnings.join("; ")}` : "")
+          );
+          state = await readGroupState(
+            auth,
+            fetcher,
+            groupId,
+            submission.versionNumber,
+            questions
+          );
+          observedStates.set(groupId, state);
+        } else if (state.objective && state.hasKey && state.score !== 100) {
+          const corrected = applyPlatformAnswers(submission, state);
+          if (!corrected) {
+            log("warn", `correct ${groupId}: platform key could not be applied`);
+          } else {
+            effective = corrected;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            const correctedResult = await submitChapterScore(
+              { token: auth.token, baseUrl: IPUB_BASE },
+              meta,
+              corrected,
+              fetcher
+            );
+            log(
+              "info",
+              `correct ${groupId} score=${state.score ?? "?"} -> answer key HTTP ${correctedResult.status}`
+            );
+            if (correctedResult.ok) {
+              state = await readGroupState(
+                auth,
+                fetcher,
+                groupId,
+                submission.versionNumber,
+                questions
+              );
+              observedStates.set(groupId, state);
+              log("info", `corrected ${groupId} score=${state.score ?? "?"}`);
+            } else {
+              log("warn", `correct ${groupId} failed: HTTP ${correctedResult.status}`);
+            }
+          }
+        }
       }
-      const result = await submitChapterScore(
-        { token: auth.token, baseUrl: IPUB_BASE },
-        meta,
-        submission,
-        fetcher
-      );
-      log(
-        "info",
-        `submitScore ${submission.groupId} HTTP ${result.status} code ${result.json?.code ?? "?"}`
-      );
-      if (!result.ok) throw new Error(`submitScore failed: HTTP ${result.status}`);
+      const post = observedStates.get(groupId);
+      if (!post?.complete) {
+        const reason = post?.objective ? `\u9898\u7EC4 ${groupId} \u5BA2\u89C2\u9898\u672A\u8FBE\u5230 100 \u5206\uFF08\u5F53\u524D ${post?.score ?? "\u65E0\u5206\u6570"}\uFF09` : `\u9898\u7EC4 ${groupId} \u5C1A\u672A\u5B8C\u6210\uFF08\u5E73\u53F0\u672A\u8FD4\u56DE\u6210\u7EE9\uFF09`;
+        return { status: "needs_human", reason };
+      }
+      const doneGroups = groups.filter(
+        (item) => observedStates.get(String(item.groupId))?.complete
+      ).length;
+      return {
+        status: "in_progress",
+        progress: { groups_done: doneGroups, groups_total: groups.length },
+        wait_ms: 500,
+        checkpoint: { phase: "groups", oral_index: oralQuestions.length }
+      };
     }
   }
-  const checks = [];
-  for (const group of activity.questionGroups ?? []) {
-    const version = group.versionNumber ?? activity.questions.find((question) => question.groupId === group.groupId)?.groupVersion ?? "";
-    const result = await fetchChapterAnswerList(
-      { token: auth.token, baseUrl: IPUB_BASE },
-      group.groupId,
-      version,
-      fetcher
+  const finalStates = [];
+  for (const group of groups) {
+    finalStates.push(
+      observedStates.get(String(group.groupId)) ?? {
+        data: null,
+        nonEmpty: 0,
+        hasKey: false,
+        objective: false,
+        maxScore: 0,
+        ungraded: false,
+        complete: false
+      }
     );
-    const answered = Boolean(
-      result.data && (result.data.score !== void 0 || (result.data.userAnswersResult?.length ?? 0) > 0)
-    );
-    checks.push(answered);
   }
-  if (checks.length > 0 && checks.every(Boolean)) {
+  if (allComplete(finalStates)) {
+    const scores = finalStates.map((state) => state.score ?? null);
+    const evidence = {
+      platform_confirmed: true,
+      groups: finalStates.length,
+      scores,
+      total: scores.reduce((sum, score) => sum + (score ?? 0), 0)
+    };
+    await saveActivityState(session, rawId, { completed: true, at: Date.now(), ...evidence });
+    return { status: "completed", evidence, checkpoint: { phase: "done" } };
+  }
+  const low = finalStates.map((state, index2) => ({ state, group: groups[index2] })).filter(
+    ({ state }) => state.objective && typeof state.score === "number" && state.score < 100
+  );
+  if (low.length > 0) {
+    const detail = low.map(({ state, group }) => `${group.groupId}:${state.score}`).join(", ");
+    log("warn", `objective groups below 100: ${detail}`);
     return {
-      status: "completed",
-      evidence: { platform_confirmed: true, groups: checks.length },
-      checkpoint: { phase: "done" }
+      status: "needs_human",
+      reason: `\u5BA2\u89C2\u9898\u672A\u8FBE\u5230 100 \u5206\uFF08${detail}\uFF09\uFF0C\u9700\u8981\u4EBA\u5DE5\u68C0\u67E5`
     };
   }
-  return { status: "in_progress", wait_ms: 2e3, checkpoint: { phase: "submitted" } };
+  const readback = Number(params.checkpoint?.readback ?? 0) + 1;
+  if (readback >= 3) {
+    return {
+      status: "needs_human",
+      reason: "\u5E73\u53F0\u5C1A\u672A\u8FD4\u56DE\u5168\u90E8\u9898\u7EC4\u7684\u5206\u6570\uFF0C\u8BF7\u5230\u5B98\u65B9\u9875\u9762\u6838\u5BF9"
+    };
+  }
+  return {
+    status: "in_progress",
+    wait_ms: 2e3,
+    checkpoint: { phase: "submitted", readback }
+  };
 }
 var paperCache = /* @__PURE__ */ new Map();
 function paperReferer(meta) {
@@ -2915,19 +3199,31 @@ async function catalogPapers(params) {
   const auth = await readAuth(session);
   const fetcher = hostFetchFor(session);
   await refreshPapers(session, cfg, auth, fetcher);
+  const metas = [...paperCache.values()];
+  const statuses = /* @__PURE__ */ new Map();
+  for (let index = 0; index < metas.length; index += 4) {
+    const chunk = metas.slice(index, index + 4);
+    const results = await Promise.all(
+      chunk.map((meta) => readPaperStatus(fetcher, auth, meta).catch(() => ({ done: false, score: null })))
+    );
+    chunk.forEach((meta, offset) => statuses.set(meta.paperId, results[offset]));
+  }
   return {
-    papers: [...paperCache.values()].map((meta) => ({
-      id: meta.paperId,
-      name: meta.paperName,
-      category: meta.paperType === 3 ? "unit_test" : "challenge",
-      available: true,
-      done: false,
-      can_redo: true,
-      can_review: true,
-      score: null,
-      attempts_left: null,
-      ends_at: null
-    }))
+    papers: metas.map((meta) => {
+      const status = statuses.get(meta.paperId) ?? { done: false, score: null };
+      return {
+        id: meta.paperId,
+        name: meta.paperName,
+        category: meta.paperType === 3 ? "unit_test" : "challenge",
+        available: true,
+        done: status.done,
+        can_redo: true,
+        can_review: true,
+        score: status.score,
+        attempts_left: null,
+        ends_at: null
+      };
+    })
   };
 }
 function examQuestionKind(question) {
@@ -3055,6 +3351,57 @@ async function readPaperScore(fetcher, auth, paperData) {
   const json = await response.json();
   return json?.data ?? {};
 }
+var paperStatusCache = /* @__PURE__ */ new Map();
+function paperStatusKey(meta) {
+  return `${meta.bookId}:${meta.paperId}:${meta.paperType}`;
+}
+async function fetchLatestPaper(fetcher, auth, meta) {
+  const response = await fetcher(
+    `${IPUB_BASE}/api/reader/paper/instance/getLatestPaperInstance`,
+    {
+      method: "POST",
+      headers: { ...baseHeaders3(auth.token), "content-type": "application/json" },
+      body: JSON.stringify({
+        bookId: meta.bookId,
+        bookVersionNumber: meta.bookVersion,
+        paperId: meta.paperId,
+        versionNumber: meta.versionNumber,
+        paperType: meta.paperType ?? 3,
+        testMode: 1
+      })
+    }
+  );
+  const json = await response.json().catch(() => null);
+  return json?.code === 200 && json.data ? json.data : null;
+}
+async function readPaperStatus(fetcher, auth, meta) {
+  const key = paperStatusKey(meta);
+  const cached = paperStatusCache.get(key);
+  if (cached && (cached.done || Date.now() - cached.at < 2e4)) {
+    return { done: cached.done, score: cached.score };
+  }
+  let value = { done: false, score: null };
+  try {
+    const latest = await fetchLatestPaper(fetcher, auth, meta);
+    if (latest?.instanceId) {
+      const paperData = {
+        ...parsePaperData(latest),
+        paperId: meta.paperId,
+        versionNumber: meta.versionNumber || latest.versionNumber,
+        paperType: meta.paperType
+      };
+      const score = await readPaperScore(fetcher, auth, paperData);
+      value = {
+        done: score.status === 1,
+        score: score.paperScore?.userScore ?? score.totalScore ?? null
+      };
+    }
+  } catch (error) {
+    log("warn", `paper status ${meta.paperId} failed: ${errorText(error)}`);
+  }
+  paperStatusCache.set(key, { ...value, at: Date.now() });
+  return value;
+}
 async function examOpen(params) {
   const session = String(params.session ?? "");
   const cfg = courseConfig();
@@ -3068,16 +3415,46 @@ async function examOpen(params) {
     meta = paperCache.get(paperId);
   }
   if (!meta) throw { code: "not_found", message: "\u8BD5\u5377\u4E0D\u5B58\u5728" };
+  const forceNew = params.force_new === true;
+  const statusKey = paperStatusKey(meta);
   let paperData;
-  if (meta.paperType === 2) {
-    const instance = await createChallengeInstance(
-      { token: auth.token, baseUrl: IPUB_BASE },
-      { bookId: cfg.bookId, bookVersionNumber: cfg.bookVersion, paperId: meta.paperId },
-      fetcher
-    );
-    paperData = parsePaperData(instance);
-  } else {
-    paperData = await createUnitTestInstance(fetcher, auth, cfg, meta);
+  if (!forceNew) {
+    const latest = await fetchLatestPaper(fetcher, auth, meta);
+    if (latest?.instanceId) {
+      const candidate = {
+        ...parsePaperData(latest),
+        paperId: meta.paperId,
+        versionNumber: meta.versionNumber || latest.versionNumber,
+        paperType: meta.paperType
+      };
+      const score = await readPaperScore(fetcher, auth, candidate);
+      if (score.status === 1) {
+        paperStatusCache.set(statusKey, {
+          done: true,
+          score: score.paperScore?.userScore ?? score.totalScore ?? null,
+          at: Date.now()
+        });
+        throw {
+          code: "already_submitted",
+          message: "\u8BE5\u8BD5\u5377\u5DF2\u4EA4\u5377\uFF1B\u5982\u9700\u91CD\u65B0\u4F5C\u7B54\uFF0C\u8BF7\u4F7F\u7528\u201C\u91CD\u505A\u201D"
+        };
+      }
+      paperData = candidate;
+      log("info", `exam resume ${meta.paperId} instance=${candidate.instanceId}`);
+    }
+  }
+  if (forceNew) paperStatusCache.delete(statusKey);
+  if (!paperData) {
+    if (meta.paperType === 2) {
+      const instance = await createChallengeInstance(
+        { token: auth.token, baseUrl: IPUB_BASE },
+        { bookId: cfg.bookId, bookVersionNumber: cfg.bookVersion, paperId: meta.paperId },
+        fetcher
+      );
+      paperData = parsePaperData(instance);
+    } else {
+      paperData = await createUnitTestInstance(fetcher, auth, cfg, meta);
+    }
   }
   if (!paperData.instanceId) throw new Error("\u8BD5\u5377\u5B9E\u4F8B\u7F3A\u5C11 instanceId");
   log(
@@ -3223,14 +3600,22 @@ async function examReadback(params) {
   const state = stored?.value;
   if (!state?.paperData) throw { code: "not_found", message: "\u8BD5\u5377\u5B9E\u4F8B\u4E0D\u5B58\u5728" };
   const score = await readPaperScore(fetcher, auth, state.paperData);
+  const userScore = score.paperScore?.userScore ?? score.totalScore ?? null;
+  if (score.status === 1) {
+    paperStatusCache.set(paperStatusKey(state.meta), {
+      done: true,
+      score: userScore,
+      at: Date.now()
+    });
+  }
   log(
     "info",
-    `exam readback status=${score.status ?? "?"} score=${score.paperScore?.userScore ?? score.totalScore ?? "?"}`
+    `exam readback status=${score.status ?? "?"} score=${userScore ?? "?"}`
   );
   return {
     confirmed: score.status === 1,
     attempt_id: attemptId,
-    score: score.paperScore?.userScore ?? score.totalScore ?? null,
+    score: userScore,
     graded_answers: [],
     review: null
   };
@@ -3413,15 +3798,17 @@ async function catalogUnits(params) {
       try {
         const structure = await getChapterStructure(fetcher, auth.token, cfg, chapterId);
         const activities = structure?.structure?.activities ?? [];
-        activities.forEach((activity, activityIndex) => {
-          if (!activity.questions?.length) return;
+        for (const [activityIndex, activity] of activities.entries()) {
+          if (!activity.questions?.length) continue;
           const groupTypes = (activity.questionGroups ?? []).map((group) => String(group.groupType ?? "")).filter(Boolean);
           if (groupTypes.length > 0 && groupTypes.every((type) => /multi_media_upload/.test(type))) {
-            return;
+            continue;
           }
-          const key = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
+          const activityKey = activity.anchor ?? activity.title ?? `activity-${activityIndex}`;
+          const id = `q::${chapterId}::${encodeURIComponent(activityKey)}::${activityIndex}`;
+          const saved = await readActivityState(session, id);
           units.push({
-            id: `q::${chapterId}::${encodeURIComponent(key)}::${activityIndex}`,
+            id,
             name: String(activity.title ?? `\u9898\u76EE ${activityIndex + 1}`).trim(),
             chapter_id: chapterId,
             chapter_name: chapterName,
@@ -3429,12 +3816,12 @@ async function catalogUnits(params) {
             kind: "document",
             duration_seconds: 0,
             watched_seconds: 0,
-            state: "not_started",
+            state: saved?.completed === true ? "completed" : "not_started",
             video_id: null,
             selectable: true,
             selectable_note: (activity.questionGroups ?? []).map((group) => group.groupType).filter(Boolean).join(",")
           });
-        });
+        }
       } catch (error) {
         log("warn", `chapter structure ${chapterId} failed: ${errorText(error)}`);
       }
@@ -3653,7 +4040,7 @@ async function dispatch(method, params) {
     case "exam.review":
       return examReview(params);
     case "exam.redo":
-      return examOpen(params);
+      return examOpen({ ...params, force_new: true });
     case "exam.heartbeat":
       return { ok: true };
     case "study.step":
