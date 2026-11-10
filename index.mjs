@@ -1284,7 +1284,17 @@ async function fetchCourseTree(options, fetcher = fetch) {
   const json = JSON.parse(text);
   if (json.course) {
     const parsed = JSON.parse(json.course);
-    return Array.isArray(parsed) ? parsed : parsed.units ?? [];
+    const course = Array.isArray(parsed) ? { units: parsed } : parsed;
+    const units = Array.isArray(course.units) ? course.units : [];
+    const version = course.version ?? json.publish_version ?? json.version;
+    return {
+      units,
+      ...course.name ? { name: String(course.name) } : {},
+      ...course.externalId !== void 0 && course.externalId !== null ? { externalId: String(course.externalId) } : {},
+      ...course.externalVersion !== void 0 && course.externalVersion !== null ? { externalVersion: String(course.externalVersion) } : {},
+      ...version !== void 0 ? { version: String(version) } : {},
+      ...json.publish_version !== void 0 ? { publishVersion: String(json.publish_version) } : {}
+    };
   }
   throw new Error(`fetchCourseTree: ${json.msg ?? `code ${json.code}`}`);
 }
@@ -1865,16 +1875,13 @@ var SETTINGS = (() => {
     return {};
   }
 })();
-var SOURCE = SETTINGS.source === "live" ? "live" : "fixture";
-var TARGET_URL = typeof SETTINGS.target_url === "string" ? SETTINGS.target_url : "https://ucontent.unipus.cn/_ipublishpc_default/pc.html";
-var COURSE_ID = typeof SETTINGS.course_id === "string" ? SETTINGS.course_id : "";
-var COURSE_NAME = typeof SETTINGS.course_name === "string" && SETTINGS.course_name.trim() ? SETTINGS.course_name.trim() : "U\u6821\u56ED\u8BFE\u7A0B";
-var BOOK_ID = typeof SETTINGS.book_id === "string" ? SETTINGS.book_id : "";
-var BOOK_VERSION = typeof SETTINGS.book_version === "string" ? SETTINGS.book_version : "";
-var IPUB_BASE = typeof SETTINGS.base_url === "string" && SETTINGS.base_url.trim() ? SETTINGS.base_url.trim() : "https://ipub.unipus.cn";
-var CONTENT_BASE = typeof SETTINGS.content_base_url === "string" && SETTINGS.content_base_url.trim() ? SETTINGS.content_base_url.trim() : "https://ucontent.unipus.cn";
+var SOURCE = SETTINGS.source === "fixture" ? "fixture" : "live";
+var IPUB_BASE = typeof SETTINGS.reader_url === "string" && SETTINGS.reader_url.trim() ? SETTINGS.reader_url.trim().replace(/\/$/, "") : typeof SETTINGS.base_url === "string" && SETTINGS.base_url.trim() ? SETTINGS.base_url.trim().replace(/\/$/, "") : "https://ipub.unipus.cn";
+var CONTENT_BASE = typeof SETTINGS.content_url === "string" && SETTINGS.content_url.trim() ? SETTINGS.content_url.trim().replace(/\/$/, "") : typeof SETTINGS.content_base_url === "string" && SETTINGS.content_base_url.trim() ? SETTINGS.content_base_url.trim().replace(/\/$/, "") : "https://ucontent.unipus.cn";
+var PORTAL_BASE = typeof SETTINGS.portal_url === "string" && SETTINGS.portal_url.trim() ? SETTINGS.portal_url.trim().replace(/\/$/, "") : "https://uai.unipus.cn";
+var TARGET_URL = typeof SETTINGS.player_url === "string" && SETTINGS.player_url.trim() ? SETTINGS.player_url.trim() : typeof SETTINGS.target_url === "string" && SETTINGS.target_url.trim() ? SETTINGS.target_url.trim() : `${CONTENT_BASE}/_ipublishpc_default/pc.html`;
 var SSO_BASE = "https://sso.unipus.cn";
-var UCONTENT_BASE = "https://ucontent.unipus.cn";
+var UCONTENT_BASE = CONTENT_BASE;
 var LOGIN_AES_KEY2 = Buffer.from("8AD70B641C024C7ADA2ECD082EC0334F", "hex");
 var LOGIN_AES_IV2 = Buffer.from("0102030405060708090A0B0C0D0E0F10", "hex");
 var ANNOTATOR_SECRET2 = "a824b379f126b8b7aa5e33dee83fb0a05aa7462c";
@@ -1935,6 +1942,135 @@ function decodeJwtExpiry(token) {
     return typeof claims.exp === "number" ? claims.exp : void 0;
   } catch {
     return void 0;
+  }
+}
+function decodeJwtPayload2(token) {
+  try {
+    return JSON.parse(Buffer.from(String(token).split(".")[1], "base64url").toString("utf8"));
+  } catch {
+    return void 0;
+  }
+}
+function jwtOpenId(token) {
+  const claims = decodeJwtPayload2(token);
+  const value = claims?.openId ?? claims?.open_id ?? claims?.sub ?? claims?.boid;
+  return typeof value === "string" ? value : "";
+}
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== "object") return "";
+  const wanted = String(name).toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key).toLowerCase() === wanted) return String(value ?? "");
+  }
+  return "";
+}
+async function followRedirects(session, startUrl, maxHops = 8, headers = {}) {
+  let current = String(startUrl);
+  let response;
+  for (let hop = 0; hop < maxHops; hop += 1) {
+    response = await hostCall("cw.net.fetch", {
+      session,
+      method: "GET",
+      url: current,
+      stage: "read",
+      headers: {
+        ...BROWSER_HEADERS,
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ...headers
+      }
+    });
+    const location = headerValue(response?.headers, "location");
+    if (!location) return { url: current, response };
+    current = new URL(location, current).toString();
+  }
+  return { url: current, response };
+}
+async function validateServiceTicket(session, service, ticket) {
+  const url = `${SSO_BASE}/sso/serviceTicket/validate?service=${encodeURIComponent(service)}&ticket=${encodeURIComponent(ticket)}`;
+  const response = await hostCall("cw.net.fetch", {
+    session,
+    method: "GET",
+    url,
+    stage: "read",
+    headers: {
+      ...BROWSER_HEADERS,
+      accept: "application/json, text/plain, */*"
+    }
+  });
+  const text = typeof response?.body === "string" ? response.body : "";
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = void 0;
+  }
+  const code = json?.code;
+  const rs = json?.rs ?? json?.data ?? json;
+  const jwt = rs?.jwt;
+  if (typeof jwt !== "string" || !jwt) {
+    log("warn", `serviceTicket/validate rejected: HTTP ${response?.status ?? "?"} code ${code ?? "?"} ${text.slice(0, 160)}`);
+    return null;
+  }
+  const expiresAt = typeof rs?.jwtExpire === "number" ? rs.jwtExpire : typeof rs?.jwtExpire === "string" ? Number(rs.jwtExpire) || void 0 : decodeJwtExpiry(jwt);
+  return {
+    jwt,
+    expiresAt,
+    refreshToken: typeof rs?.rt === "string" && rs.rt ? rs.rt : void 0,
+    refreshExpiresAt: typeof rs?.rtExpire === "number" ? rs.rtExpire : void 0
+  };
+}
+async function browserReadJwt(session, url) {
+  let page;
+  try {
+    const opened = await hostCall("cw.browser.open", {
+      session,
+      url,
+      purpose: "portal-token"
+    });
+    page = opened?.page;
+    if (!page) throw new Error("\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762\u53E5\u67C4");
+    const expression = `(async () => {
+      const read = () => {
+        let jwt = null;
+        let rt = null;
+        let expires = null;
+        try {
+          const raw = localStorage.getItem('PORTAL_STATE_PERSISTENT');
+          const parsed = raw ? JSON.parse(raw) : null;
+          jwt = parsed?.tokenInfo?.jwt ?? parsed?.Authorization ?? null;
+          rt = parsed?.tokenInfo?.rt ?? null;
+          expires = parsed?.tokenInfo?.jwtExpire ?? null;
+        } catch {}
+        if (!jwt) {
+          try {
+            const match = document.cookie.match(/(?:^|;\\s*)jwt=([^;]+)/);
+            if (match) jwt = decodeURIComponent(match[1]).trim();
+          } catch {}
+        }
+        return { href: location.href, jwt, rt, expires };
+      };
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const value = read();
+        if (value.jwt) return value;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return read();
+    })()`;
+    const result = await hostCall("cw.browser.evaluate", {
+      session,
+      page,
+      expression,
+      stage: "read"
+    });
+    if (!result?.jwt) return null;
+    return {
+      jwt: String(result.jwt),
+      expiresAt: typeof result.expires === "number" ? result.expires : Number(result.expires) || decodeJwtExpiry(String(result.jwt)),
+      refreshToken: typeof result.rt === "string" && result.rt ? result.rt : void 0
+    };
+  } finally {
+    if (page) await hostCall("cw.browser.close", { session, page }).catch(() => {
+    });
   }
 }
 var challenges = /* @__PURE__ */ new Map();
@@ -2038,87 +2174,35 @@ async function liveLogin(session, username, password) {
   const ticket = login.rs?.serviceTicket;
   const openId = login.rs?.openid;
   if (!ticket) throw new Error("SSO \u672A\u8FD4\u56DE serviceTicket");
-  if (!openId) throw new Error("SSO \u672A\u8FD4\u56DE openid");
   const redeem = service.includes("?") ? `${service}&ticket=${ticket}` : `${service}?ticket=${ticket}`;
   try {
-    await hostCall("cw.net.fetch", {
-      session,
-      method: "GET",
-      url: redeem,
-      stage: "read",
-      headers: {
-        ...BROWSER_HEADERS,
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-      }
-    });
+    await followRedirects(session, redeem, 8);
   } catch (error) {
-    if (error?.code !== "platform_verification_required") throw error;
-    log("warn", "ticket redeem returned 403; continuing with captured cookies");
+    log("warn", `ticket redeem failed: ${errorText(error)}`);
   }
-  if (!COURSE_ID) {
-    throw new Error("live \u6A21\u5F0F\u9700\u8981\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u63D0\u4F9B course_id\uFF08reader token \u4EA4\u6362\u7528\uFF09");
-  }
-  const annotator = signAnnotatorToken2(openId);
-  let page;
-  try {
-    const opened = await hostCall("cw.browser.open", {
-      session,
-      url: TARGET_URL,
-      purpose: "reader-token"
-    });
-    page = opened?.page;
-    if (!page) throw new Error("\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762\u53E5\u67C4");
-    const expression = `(async () => {
-      const res = await fetch('/course/api/v3/ipublish/token', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json, text/plain, */*',
-          'x-annotator-auth-token': ${JSON.stringify(annotator)}
-        },
-        credentials: 'include',
-        body: JSON.stringify({ courseId: ${JSON.stringify(COURSE_ID)}, readerType: 2 })
-      });
-      const text = await res.text();
-      let payload = null;
-      try { payload = JSON.parse(text); } catch {}
-      return {
-        href: location.href,
-        status: res.status,
-        code: payload?.code ?? 'non-json',
-        token: payload?.data?.token ?? null,
-        message: payload?.message ?? text.slice(0, 160)
-      };
-    })()`;
-    let result = null;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      result = await hostCall("cw.browser.evaluate", {
-        session,
-        page,
-        expression,
-        stage: "read"
-      });
-      if (result && result.loading !== true) break;
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    if (!result || result.loading === true) {
-      throw new Error("\u5B98\u65B9\u9875\u9762\u5C1A\u672A\u5C31\u7EEA\uFF0C\u65E0\u6CD5\u4EA4\u6362 reader token");
-    }
-    if (result.status !== 200 || !result.token) {
-      throw new Error(`reader token \u6D4F\u89C8\u5668\u8BF7\u6C42\u5931\u8D25\uFF1AHTTP ${result.status} @ ${result.href ?? ""} ${result.message ?? ""}`.trim());
-    }
-    return {
-      token: result.token,
-      openId,
-      expiresAt: decodeJwtExpiry(result.token),
-      displayName: username
-    };
-  } finally {
-    if (page) {
-      await hostCall("cw.browser.close", { session, page }).catch(() => {
-      });
+  let jwtInfo = await browserReadJwt(session, TARGET_URL).catch(() => null);
+  if (!jwtInfo?.jwt) {
+    try {
+      jwtInfo = await validateServiceTicket(session, service, ticket);
+    } catch (error) {
+      log("warn", `serviceTicket/validate failed: ${errorText(error)}`);
     }
   }
+  if (!jwtInfo?.jwt) {
+    jwtInfo = await browserReadJwt(session, PORTAL_BASE).catch(() => null);
+  }
+  if (!jwtInfo?.jwt) {
+    throw new Error("SSO \u767B\u5F55\u6210\u529F\uFF0C\u4F46\u6CA1\u6709\u53D6\u5F97 JWT\uFF1B\u8BF7\u786E\u8BA4\u8D26\u53F7\u53EF\u4EE5\u5728 U\u6821\u56ED\u7F51\u9875\u7AEF\u767B\u5F55");
+  }
+  const resolvedOpenId = String(openId ?? "") || jwtOpenId(jwtInfo.jwt);
+  if (!resolvedOpenId) throw new Error("SSO \u672A\u8FD4\u56DE openid");
+  return {
+    jwt: jwtInfo.jwt,
+    openId: resolvedOpenId,
+    expiresAt: jwtInfo.expiresAt ?? decodeJwtExpiry(jwtInfo.jwt),
+    refreshToken: jwtInfo.refreshToken,
+    displayName: username
+  };
 }
 async function authSubmit(params) {
   const id = String(params.challenge ?? "");
@@ -2135,7 +2219,7 @@ async function authSubmit(params) {
     let identity;
     if (SOURCE === "fixture") {
       identity = {
-        token: "fixture-reader-token",
+        jwt: "fixture-jwt",
         openId: "unipus-fixture",
         displayName: "U\u6821\u56ED\uFF08\u79BB\u7EBF\uFF09",
         expiresAt: void 0
@@ -2148,15 +2232,16 @@ async function authSubmit(params) {
       display_name: identity.displayName,
       account_raw: identity.openId
     };
-    challenge.token = identity.token;
     await hostCall("cw.state", {
       session: id,
       namespace: "auth",
       key: "session",
       value: {
-        token: identity.token,
+        jwt: identity.jwt,
         open_id: identity.openId,
+        display_name: identity.displayName,
         expires_at: identity.expiresAt ?? null,
+        refresh_token: identity.refreshToken ?? null,
         source: SOURCE,
         connected_at: Date.now()
       }
@@ -2194,8 +2279,52 @@ async function authVerify(params) {
       connected_at: identity?.connected_at ?? null
     };
   } catch {
-    return { display_name: "U\u6821\u56ED", account_raw: "" };
+    try {
+      const stored = await hostCall("cw.state", {
+        session: params.session,
+        namespace: "auth",
+        key: "session"
+      });
+      const value = stored?.value;
+      return {
+        display_name: value?.display_name ?? "U\u6821\u56ED",
+        account_raw: value?.open_id ?? "",
+        connected_at: value?.connected_at ?? null
+      };
+    } catch {
+      return { display_name: "U\u6821\u56ED", account_raw: "" };
+    }
   }
+}
+async function refreshPortalJwt(session, refreshToken) {
+  const response = await hostCall("cw.net.fetch", {
+    session,
+    method: "POST",
+    url: `${SSO_BASE}/sso/4.0/sso/refresh_jwt`,
+    encoding: "json",
+    stage: "read",
+    headers: {
+      ...BROWSER_HEADERS,
+      origin: SSO_BASE,
+      accept: "application/json, text/plain, */*"
+    },
+    body: { rt: refreshToken }
+  });
+  const text = typeof response?.body === "string" ? response.body : "";
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = void 0;
+  }
+  const rs = json?.rs ?? json?.data ?? json;
+  if (!rs?.jwt) return null;
+  return {
+    jwt: String(rs.jwt),
+    expires_at: typeof rs.jwtExpire === "number" ? rs.jwtExpire : Number(rs.jwtExpire) || decodeJwtExpiry(String(rs.jwt)) || null,
+    refresh_token: typeof rs.rt === "string" && rs.rt ? rs.rt : refreshToken,
+    refresh_expires_at: typeof rs.rtExpire === "number" ? rs.rtExpire : null
+  };
 }
 async function authKeepalive(params) {
   if (SOURCE === "fixture") return { ok: true, mode: SOURCE };
@@ -2205,8 +2334,24 @@ async function authKeepalive(params) {
       namespace: "auth",
       key: "session"
     });
-    if (!state?.value?.token) return { ok: false, reason: "no-token" };
-    return { ok: true, mode: SOURCE, expires_at: state.value.expires_at ?? null };
+    let value = state?.value;
+    if (!value?.jwt) return { ok: false, reason: "no-token" };
+    const expiresAt = Number(value.expires_at ?? 0);
+    if (expiresAt > 0 && expiresAt * 1e3 < Date.now() + 5 * 60 * 1e3 && value.refresh_token) {
+      const refreshed = await refreshPortalJwt(params.session, value.refresh_token).catch(() => null);
+      if (refreshed) {
+        value = { ...value, ...refreshed, connected_at: value.connected_at };
+        await hostCall("cw.state", {
+          session: params.session,
+          namespace: "auth",
+          key: "session",
+          value
+        });
+      } else {
+        return { ok: false, reason: "jwt-expired" };
+      }
+    }
+    return { ok: true, mode: SOURCE, expires_at: value.expires_at ?? null };
   } catch (error) {
     return { ok: false, reason: error.message ?? "state-unavailable" };
   }
@@ -2270,12 +2415,278 @@ function baseHeaders3(token) {
 async function readAuth(session) {
   const stored = await hostCall("cw.state", { session, namespace: "auth", key: "session" });
   const value = stored?.value;
-  if (!value?.token) throw { code: "platform_login_expired", message: "\u8BF7\u5148\u8FDE\u63A5 U\u6821\u56ED" };
+  if (!value?.jwt || !value?.open_id) {
+    throw { code: "platform_login_expired", message: "\u8BF7\u5148\u8FDE\u63A5 U\u6821\u56ED\uFF0C\u5F53\u524D\u767B\u5F55\u6001\u5DF2\u5931\u6548" };
+  }
   return value;
 }
-function courseConfig() {
-  if (!COURSE_ID || !BOOK_ID || !BOOK_VERSION) return null;
-  return { id: COURSE_ID, name: COURSE_NAME, bookId: BOOK_ID, bookVersion: BOOK_VERSION };
+var COURSE_LIST_TTL_MS = 6e4;
+var courseListCache = /* @__PURE__ */ new Map();
+var COURSE_GROUP_ORDER = ["CLASS_COURSE", "SCHOOL_INNER", "PERSONAL"];
+function mapBookshelf(groups) {
+  if (!groups || typeof groups !== "object") return [];
+  const courses = [];
+  const seen = /* @__PURE__ */ new Set();
+  const groupNames = [
+    ...COURSE_GROUP_ORDER,
+    ...Object.keys(groups).filter((name) => !COURSE_GROUP_ORDER.includes(name) && name !== "EXPIRED")
+  ];
+  for (const groupName of groupNames) {
+    const items = Array.isArray(groups[groupName]) ? groups[groupName] : [];
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const id = String(
+        item.resourceId ?? item.resource_id ?? item.courseId ?? item.course_id ?? item.classCourseId ?? item.class_course_id ?? item.id ?? ""
+      ).trim();
+      if (!id || seen.has(id)) continue;
+      const recruitId = String(
+        item.classCourseId ?? item.class_course_id ?? item.classId ?? item.class_id ?? item.clazzId ?? item.resourceId ?? item.resource_id ?? id
+      ).trim() || id;
+      const name = String(item.name ?? item.title ?? item.tutorialName ?? item.resourceName ?? "").trim() || id;
+      seen.add(id);
+      courses.push({
+        id,
+        recruit_id: recruitId,
+        name,
+        kind: "shared",
+        kind_label: "U\u6821\u56ED\u8BFE\u7A0B",
+        family: "shared",
+        progress: null,
+        outline_available: true,
+        ...recruitId !== id ? { class_course_id: recruitId } : {},
+        ...item.instanceId ? { instance_id: String(item.instanceId) } : {},
+        ...Array.isArray(item.classCourses) ? {
+          class_courses: item.classCourses.filter((entry) => entry && entry.courseId !== void 0).map((entry) => ({
+            course_id: String(entry.courseId),
+            ...entry.classId !== void 0 ? { class_id: String(entry.classId) } : {},
+            ...entry.courseName ? { course_name: String(entry.courseName) } : {},
+            ...entry.className ? { class_name: String(entry.className) } : {}
+          }))
+        } : {}
+      });
+    }
+  }
+  return courses;
+}
+async function fetchBookshelf(session, jwt) {
+  const response = await hostCall("cw.net.fetch", {
+    session,
+    method: "GET",
+    url: `${PORTAL_BASE}/api/cmgt/course/my/bookshelf`,
+    stage: "read",
+    headers: {
+      ...BROWSER_HEADERS,
+      authorization: jwt,
+      accept: "application/json, text/plain, */*"
+    }
+  });
+  if (response?.status === 401 || response?.status === 403) {
+    throw { code: "platform_login_expired", message: "U\u6821\u56ED\u767B\u5F55\u6001\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u8FDE\u63A5" };
+  }
+  const text = typeof response?.body === "string" ? response.body : "";
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`\u8BFE\u7A0B\u5217\u8868\u8FD4\u56DE\u975E JSON\uFF08HTTP ${response?.status ?? "?"}\uFF09`);
+  }
+  const code = json?.code;
+  if (code !== 0 && code !== 1 && code !== 200 && code !== "0" && code !== "1" && code !== "200") {
+    throw new Error(`\u8BFE\u7A0B\u5217\u8868\u5931\u8D25\uFF1Acode ${code ?? "?"} ${json?.msg ?? json?.message ?? text.slice(0, 160)}`);
+  }
+  const value = json?.value ?? json?.data?.value ?? json?.data ?? {};
+  const groups = value?.groups ?? value;
+  if (!groups || typeof groups !== "object") throw new Error("\u8BFE\u7A0B\u5217\u8868\u7F3A\u5C11 groups");
+  return groups;
+}
+async function loadCourses(session) {
+  const cached = courseListCache.get(session);
+  if (cached && Date.now() - cached.at < COURSE_LIST_TTL_MS) return cached.value;
+  const auth = await readAuth(session);
+  let groups;
+  try {
+    groups = await fetchBookshelf(session, auth.jwt);
+  } catch (error) {
+    if (error?.code === "platform_login_expired") throw error;
+    const stored = await hostCall("cw.state", {
+      session,
+      namespace: "unipus-v1",
+      key: "courses"
+    }).catch(() => null);
+    const fallback = stored?.value;
+    const cachedCourses = fallback?.courses;
+    if (fallback?.open_id === auth.open_id && Array.isArray(cachedCourses) && cachedCourses.length > 0) {
+      courseListCache.set(session, { at: Date.now(), value: cachedCourses });
+      return cachedCourses;
+    }
+    throw error;
+  }
+  const courses = mapBookshelf(groups);
+  courseListCache.set(session, { at: Date.now(), value: courses });
+  await hostCall("cw.state", {
+    session,
+    namespace: "unipus-v1",
+    key: "courses",
+    value: { at: Date.now(), open_id: auth.open_id, courses, groups }
+  }).catch(() => {
+  });
+  return courses;
+}
+function readerTokenExpired(value) {
+  const expiresAt = Number(value?.expires_at ?? 0);
+  return expiresAt > 0 && expiresAt * 1e3 < Date.now() + 6e4;
+}
+async function exchangeReaderTokenHttp(session, auth, courseId) {
+  const response = await hostCall("cw.net.fetch", {
+    session,
+    method: "POST",
+    url: `${CONTENT_BASE}/course/api/v3/ipublish/token`,
+    encoding: "json",
+    stage: "read",
+    headers: {
+      ...BROWSER_HEADERS,
+      authorization: auth.jwt,
+      "x-annotator-auth-token": signAnnotatorToken2(auth.open_id),
+      accept: "application/json, text/plain, */*"
+    },
+    body: { courseId, readerType: 2 }
+  });
+  const text = typeof response?.body === "string" ? response.body : "";
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`reader token \u8FD4\u56DE\u975E JSON\uFF08HTTP ${response?.status ?? "?"}\uFF09`);
+  }
+  const token = json?.data?.token;
+  if (json?.code !== 0 && json?.code !== 200 && json?.code !== "0" || !token) {
+    throw new Error(
+      `reader token \u5931\u8D25\uFF1Acode ${json?.code ?? "?"} ${json?.message ?? text.slice(0, 160)}`
+    );
+  }
+  return { token: String(token), expires_at: decodeJwtExpiry(String(token)) ?? null };
+}
+async function exchangeReaderTokenBrowser(session, auth, courseId) {
+  const annotator = signAnnotatorToken2(auth.open_id);
+  let page;
+  try {
+    const opened = await hostCall("cw.browser.open", {
+      session,
+      url: TARGET_URL,
+      purpose: "reader-token"
+    });
+    page = opened?.page;
+    if (!page) throw new Error("\u5B98\u65B9\u6D4F\u89C8\u5668\u6CA1\u6709\u8FD4\u56DE\u9875\u9762\u53E5\u67C4");
+    const expression = `(async () => {
+      const res = await fetch('/course/api/v3/ipublish/token', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/plain, */*',
+          authorization: ${JSON.stringify(auth.jwt)},
+          'x-annotator-auth-token': ${JSON.stringify(annotator)}
+        },
+        credentials: 'include',
+        body: JSON.stringify({ courseId: ${JSON.stringify(courseId)}, readerType: 2 })
+      });
+      const text = await res.text();
+      let payload = null;
+      try { payload = JSON.parse(text); } catch {}
+      return {
+        href: location.href,
+        status: res.status,
+        code: payload?.code ?? 'non-json',
+        token: payload?.data?.token ?? null,
+        message: payload?.message ?? text.slice(0, 160)
+      };
+    })()`;
+    let result = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      result = await hostCall("cw.browser.evaluate", {
+        session,
+        page,
+        expression,
+        stage: "read"
+      });
+      if (result && result.loading !== true) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (!result || result.loading === true || result.status !== 200 || !result.token) {
+      throw new Error(
+        `reader token \u6D4F\u89C8\u5668\u8BF7\u6C42\u5931\u8D25\uFF1AHTTP ${result?.status ?? "?"} @ ${result?.href ?? ""} ${result?.message ?? ""}`.trim()
+      );
+    }
+    return {
+      token: String(result.token),
+      expires_at: decodeJwtExpiry(String(result.token)) ?? null
+    };
+  } finally {
+    if (page) await hostCall("cw.browser.close", { session, page }).catch(() => {
+    });
+  }
+}
+async function readerTokenFor(session, auth, courseId) {
+  const key = `reader/${courseId}`;
+  const stored = await hostCall("cw.state", { session, namespace: "auth", key });
+  const value = stored?.value;
+  if (value?.token && value.open_id === auth.open_id && !readerTokenExpired(value)) {
+    return String(value.token);
+  }
+  let tokenValue;
+  try {
+    tokenValue = await exchangeReaderTokenHttp(session, auth, courseId);
+  } catch (error) {
+    log("warn", `reader token http failed for ${courseId}: ${errorText(error)}`);
+    tokenValue = await exchangeReaderTokenBrowser(session, auth, courseId);
+  }
+  await hostCall("cw.state", {
+    session,
+    namespace: "auth",
+    key,
+    value: { ...tokenValue, open_id: auth.open_id, at: Date.now() }
+  });
+  return String(tokenValue.token);
+}
+async function loadCourse(session, publicCourse) {
+  const classCourseIds = Array.isArray(publicCourse?.class_courses) ? publicCourse.class_courses.flatMap((entry) => [entry?.course_id, entry?.class_id]) : [];
+  const candidates = [
+    publicCourse?.instance_id,
+    publicCourse?.id,
+    publicCourse?.class_course_id,
+    publicCourse?.recruit_id,
+    ...classCourseIds
+  ].map((value) => String(value ?? "").trim()).filter((value, index, list) => value && list.indexOf(value) === index);
+  if (candidates.length === 0) throw { code: "invalid_params", message: "\u8BF7\u5148\u9009\u62E9\u8BFE\u7A0B" };
+  const base = await readAuth(session);
+  const fetcher = hostFetchFor(session);
+  let lastError;
+  for (const courseId of candidates) {
+    try {
+      const token = await readerTokenFor(session, base, courseId);
+      const auth = { ...base, token };
+      const tree = await fetchCourseTree(
+        { token, cookie: "", courseId, baseUrl: CONTENT_BASE },
+        fetcher
+      );
+      const cfg = {
+        id: courseId,
+        name: String(publicCourse?.name ?? tree?.name ?? "U\u6821\u56ED\u8BFE\u7A0B"),
+        bookId: String(tree?.externalId ?? ""),
+        bookVersion: String(tree?.externalVersion ?? "")
+      };
+      if (!cfg.bookId || !cfg.bookVersion) {
+        throw {
+          code: "not_found",
+          message: "\u8BE5\u8BFE\u7A0B\u4E0D\u662F\u53EF\u7528\u7684\u6570\u5B57\u6559\u6750\uFF08\u7F3A\u5C11 bookId/bookVersion\uFF09\uFF0C\u6682\u4E0D\u652F\u6301"
+        };
+      }
+      return { auth, cfg, tree, fetcher };
+    } catch (error) {
+      lastError = lastError ?? error;
+      log("warn", `loadCourse ${courseId} failed: ${errorText(error)}`);
+    }
+  }
+  throw lastError;
 }
 function treeUnitNumber(treeUnit, index) {
   const digits = String(treeUnit?.id ?? "").replace(/[^\d]/g, "");
@@ -2348,7 +2759,7 @@ function safeJson2(value) {
 }
 var structureCache = /* @__PURE__ */ new Map();
 async function getChapterStructure(fetcher, token, cfg, chapterId) {
-  const key = `${cfg.bookId}:${chapterId}`;
+  const key = `${cfg.bookId}:${cfg.bookVersion}:${chapterId}`;
   const cached = structureCache.get(key);
   if (cached && Date.now() - cached.at < 10 * 60 * 1e3) return cached.value;
   const value = await fetchChapterStructure(
@@ -3452,6 +3863,9 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
   };
 }
 var paperCache = /* @__PURE__ */ new Map();
+function paperCacheKey(bookId, bookVersion, paperId) {
+  return `${bookId}:${bookVersion}:${paperId}`;
+}
 function paperReferer(meta) {
   return buildChapterReferer({
     bookId: meta.bookId,
@@ -3460,11 +3874,14 @@ function paperReferer(meta) {
   });
 }
 async function refreshPapers(session, cfg, auth, fetcher) {
+  for (const key of [...paperCache.keys()]) {
+    if (key.startsWith(`${cfg.bookId}:${cfg.bookVersion}:`)) paperCache.delete(key);
+  }
   const tree = await fetchCourseTree(
     { token: auth.token, cookie: "", courseId: cfg.id, baseUrl: CONTENT_BASE },
     fetcher
   );
-  const treeLinks = collectQuizLinks(tree);
+  const treeLinks = collectQuizLinks(tree.units);
   const chapters = await fetchChapterList(fetcher, auth.token, cfg);
   const collected = [];
   for (const link of treeLinks) {
@@ -3539,13 +3956,14 @@ async function refreshPapers(session, cfg, auth, fetcher) {
       log("warn", `paper version ${paperId} failed: ${errorText(error)}`);
     }
     if (paperType !== 2 && paperType !== 3) paperType = 2;
-    paperCache.set(paperId, {
+    paperCache.set(paperCacheKey(cfg.bookId, cfg.bookVersion, paperId), {
       paperId,
       paperType,
       paperName,
       versionNumber,
       chapterId: entry.chapterId,
       chapterName: entry.chapterName,
+      courseId: cfg.id,
       bookId: cfg.bookId,
       bookVersion: cfg.bookVersion
     });
@@ -3554,30 +3972,30 @@ async function refreshPapers(session, cfg, auth, fetcher) {
 async function catalogPapers(params) {
   if (SOURCE !== "live") return { papers: [] };
   const session = String(params.session ?? "");
-  const cfg = courseConfig();
-  if (!cfg) throw { code: "invalid_params", message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E course_id / book_id / book_version" };
-  if (params.course?.id && params.course.id !== cfg.id) return { papers: [] };
-  const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
+  const { auth, cfg, fetcher } = await loadCourse(session, params.course);
   await refreshPapers(session, cfg, auth, fetcher);
-  const metas = [...paperCache.values()];
+  const metas = [...paperCache.values()].filter(
+    (meta) => meta.bookId === cfg.bookId && meta.bookVersion === cfg.bookVersion
+  );
   const statuses = /* @__PURE__ */ new Map();
   for (let index = 0; index < metas.length; index += 4) {
     const chunk = metas.slice(index, index + 4);
     const results = await Promise.all(
       chunk.map(
-        (meta) => readPaperStatus(fetcher, auth, meta).catch(() => ({
+        (meta) => readPaperStatus(fetcher, auth, meta, session).catch(() => ({
           done: false,
           score: null,
           unknown: true
         }))
       )
     );
-    chunk.forEach((meta, offset) => statuses.set(meta.paperId, results[offset]));
+    chunk.forEach(
+      (meta, offset) => statuses.set(paperCacheKey(meta.bookId, meta.bookVersion, meta.paperId), results[offset])
+    );
   }
   return {
     papers: metas.map((meta) => {
-      const status = statuses.get(meta.paperId) ?? {
+      const status = statuses.get(paperCacheKey(meta.bookId, meta.bookVersion, meta.paperId)) ?? {
         done: false,
         score: null,
         unknown: false
@@ -3730,8 +4148,8 @@ async function readPaperScore(fetcher, auth, paperData) {
   return json?.data ?? {};
 }
 var paperStatusCache = /* @__PURE__ */ new Map();
-function paperStatusKey(meta) {
-  return `${meta.bookId}:${meta.paperId}:${meta.paperType}`;
+function paperStatusKey(meta, session) {
+  return `${session}:${meta.bookId}:${meta.bookVersion}:${meta.paperId}:${meta.paperType}`;
 }
 async function fetchLatestPaper(fetcher, auth, meta) {
   const response = await fetcher(
@@ -3763,8 +4181,8 @@ async function fetchLatestPaper(fetcher, auth, meta) {
   }
   return json.data ?? null;
 }
-async function readPaperStatus(fetcher, auth, meta) {
-  const key = paperStatusKey(meta);
+async function readPaperStatus(fetcher, auth, meta, session) {
+  const key = paperStatusKey(meta, session);
   const cached = paperStatusCache.get(key);
   if (cached && (cached.done || Date.now() - cached.at < (cached.unknown ? 5e3 : 2e4))) {
     return { done: cached.done, score: cached.score, unknown: cached.unknown };
@@ -3799,19 +4217,17 @@ async function readPaperStatus(fetcher, auth, meta) {
 }
 async function examOpen(params) {
   const session = String(params.session ?? "");
-  const cfg = courseConfig();
-  if (!cfg) throw { code: "invalid_params", message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E course_id / book_id / book_version" };
-  const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
+  const { auth, cfg, fetcher } = await loadCourse(session, params.course);
   const paperId = String(params.paper_id ?? "");
-  let meta = paperCache.get(paperId);
+  let meta = paperCache.get(paperCacheKey(cfg.bookId, cfg.bookVersion, paperId));
   if (!meta) {
     await refreshPapers(session, cfg, auth, fetcher);
-    meta = paperCache.get(paperId);
+    meta = paperCache.get(paperCacheKey(cfg.bookId, cfg.bookVersion, paperId));
   }
   if (!meta) throw { code: "not_found", message: "\u8BD5\u5377\u4E0D\u5B58\u5728" };
+  meta = { ...meta, courseId: cfg.id };
   const forceNew = params.force_new === true;
-  const statusKey = paperStatusKey(meta);
+  const statusKey = paperStatusKey(meta, session);
   let paperData;
   if (!forceNew && meta.paperType === 3) {
     let latest;
@@ -3881,8 +4297,6 @@ async function examOpen(params) {
 }
 async function examWrite(params) {
   const session = String(params.session ?? "");
-  const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
   const attemptId = String(params.attempt_id ?? "");
   const stored = await hostCall("cw.state", {
     session,
@@ -3891,6 +4305,11 @@ async function examWrite(params) {
   });
   const state = stored?.value;
   if (!state?.paperData || !state?.meta) throw { code: "not_found", message: "\u8BD5\u5377\u5B9E\u4F8B\u4E0D\u5B58\u5728" };
+  const courseId = String(state.meta.courseId ?? params.course?.id ?? "");
+  if (!courseId) throw { code: "not_found", message: "\u8BD5\u5377\u7F3A\u5C11\u8BFE\u7A0B\u4FE1\u606F\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u8BD5\u5377" };
+  const baseAuth = await readAuth(session);
+  const auth = { ...baseAuth, token: await readerTokenFor(session, baseAuth, courseId) };
+  const fetcher = hostFetchFor(session);
   const incoming = params.answers && typeof params.answers === "object" ? params.answers : {};
   const merged = { ...state.answers ?? {}, ...incoming };
   const byQuestion = new Map(
@@ -3999,8 +4418,6 @@ async function examWrite(params) {
 }
 async function examReadback(params) {
   const session = String(params.session ?? "");
-  const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
   const attemptId = String(params.attempt_id ?? "");
   const stored = await hostCall("cw.state", {
     session,
@@ -4009,10 +4426,15 @@ async function examReadback(params) {
   });
   const state = stored?.value;
   if (!state?.paperData) throw { code: "not_found", message: "\u8BD5\u5377\u5B9E\u4F8B\u4E0D\u5B58\u5728" };
+  const courseId = String(state.meta?.courseId ?? params.course?.id ?? "");
+  if (!courseId) throw { code: "not_found", message: "\u8BD5\u5377\u7F3A\u5C11\u8BFE\u7A0B\u4FE1\u606F\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u8BD5\u5377" };
+  const baseAuth = await readAuth(session);
+  const auth = { ...baseAuth, token: await readerTokenFor(session, baseAuth, courseId) };
+  const fetcher = hostFetchFor(session);
   const score = await readPaperScore(fetcher, auth, state.paperData);
   const userScore = score.paperScore?.userScore ?? score.totalScore ?? null;
   if (score.status === 1) {
-    paperStatusCache.set(paperStatusKey(state.meta), {
+    paperStatusCache.set(paperStatusKey(state.meta ?? {}, session), {
       done: true,
       score: userScore,
       unknown: false,
@@ -4055,28 +4477,8 @@ async function examReview(params) {
 async function catalogCourses(params) {
   const session = String(params.session ?? "");
   if (SOURCE === "live") {
-    const cfg = courseConfig();
-    if (!cfg) {
-      throw {
-        code: "invalid_params",
-        message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E course_id / book_id / book_version"
-      };
-    }
-    await readAuth(session);
-    return {
-      courses: [
-        {
-          id: cfg.id,
-          recruit_id: cfg.id,
-          name: cfg.name,
-          kind: "shared",
-          kind_label: "\u5171\u4EAB\u8BFE",
-          family: "shared",
-          progress: null,
-          outline_available: true
-        }
-      ]
-    };
+    const courses = await loadCourses(session);
+    return { courses };
   }
   return {
     courses: [
@@ -4128,20 +4530,7 @@ async function catalogUnits(params) {
     };
   }
   const session = String(params.session ?? "");
-  const cfg = courseConfig();
-  if (!cfg) {
-    throw {
-      code: "invalid_params",
-      message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E course_id / book_id / book_version"
-    };
-  }
-  if (params.course?.id !== cfg.id) throw { code: "not_found", message: "\u8BFE\u7A0B\u4E0D\u5B58\u5728" };
-  const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
-  const tree = await fetchCourseTree(
-    { token: auth.token, cookie: "", courseId: cfg.id, baseUrl: CONTENT_BASE },
-    fetcher
-  );
+  const { auth, cfg, tree, fetcher } = await loadCourse(session, params.course);
   const chapters = await fetchChapterList(fetcher, auth.token, cfg);
   let durations = /* @__PURE__ */ new Map();
   try {
@@ -4158,8 +4547,8 @@ async function catalogUnits(params) {
     log("warn", `video durations failed: ${errorText(error)}`);
   }
   const units = [];
-  for (let index = 0; index < tree.length; index += 1) {
-    const treeUnit = tree[index];
+  for (let index = 0; index < tree.units.length; index += 1) {
+    const treeUnit = tree.units[index];
     const chapter = chapterForUnit(treeUnit, chapters, index);
     const chapterId = chapter?.id ? String(chapter.id) : "";
     const chapterName = String(treeUnit?.name ?? chapter?.name ?? "");
@@ -4262,34 +4651,20 @@ async function studyStep(params) {
     };
   }
   const session = String(params.session ?? "");
-  const cfg = courseConfig();
-  if (!cfg) {
-    throw {
-      code: "invalid_params",
-      message: "\u8BF7\u5728\u6A21\u5757\u8BBE\u7F6E\u91CC\u914D\u7F6E course_id / book_id / book_version"
-    };
-  }
+  const { auth, cfg, tree, fetcher } = await loadCourse(session, params.course);
   const unit = params.unit ?? {};
   const rawId = String(unit.id ?? "");
   if (rawId.startsWith("q::")) {
-    const auth2 = await readAuth(session);
-    const fetcher2 = hostFetchFor(session);
-    return studyQuestionStep(params, session, cfg, auth2, fetcher2, rawId);
+    return studyQuestionStep(params, session, cfg, auth, fetcher, rawId);
   }
   const groupId = rawId.split("::")[0];
   if (!groupId) throw { code: "invalid_params", message: "\u7F3A\u5C11\u5355\u5143 id" };
-  const auth = await readAuth(session);
-  const fetcher = hostFetchFor(session);
-  const tree = await fetchCourseTree(
-    { token: auth.token, cookie: "", courseId: cfg.id, baseUrl: CONTENT_BASE },
-    fetcher
-  );
-  const found = findGroup(tree, groupId);
+  const found = findGroup(tree.units, groupId);
   if (!found) throw { code: "not_found", message: "\u8BFE\u7A0B\u6811\u91CC\u627E\u4E0D\u5230\u8BE5\u5355\u5143" };
   const base = String(found.group.base ?? unit.lesson_id ?? "");
   const anchor = String(found.group.externalNodeId ?? unit.video_id ?? "");
   if (!anchor) throw { code: "invalid_params", message: "\u5355\u5143\u7F3A\u5C11 anchor" };
-  const index = Math.max(0, tree.indexOf(found.unit));
+  const index = Math.max(0, tree.units.indexOf(found.unit));
   const chapters = await fetchChapterList(fetcher, auth.token, cfg);
   const chapter = chapterForUnit(found.unit, chapters, index);
   if (!chapter?.id) throw { code: "not_found", message: "\u627E\u4E0D\u5230\u5BF9\u5E94\u7AE0\u8282" };
