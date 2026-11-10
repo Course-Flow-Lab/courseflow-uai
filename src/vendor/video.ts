@@ -48,6 +48,17 @@ export interface CourseTreeUnit {
   children?: CourseTreeGroup[];
 }
 
+export interface CourseTree {
+  units: CourseTreeUnit[];
+  name?: string;
+  /** The published book id (`course.externalId`). */
+  externalId?: string;
+  /** The published book version (`course.externalVersion`). */
+  externalVersion?: string;
+  version?: string;
+  publishVersion?: string;
+}
+
 export interface VideoTask {
   unit: string;
   unitName: string;
@@ -73,11 +84,11 @@ function rawToken(token: string): string {
   return token.replace(/^Bearer\s+/i, "").trim();
 }
 
-/** `GET /course/api/course/<courseId>/default` -> unit tree. */
+/** `GET /course/api/course/<courseId>/default` -> unit tree plus book metadata. */
 export async function fetchCourseTree(
   options: ContentApiOptions & { courseId: string },
   fetcher: typeof fetch = fetch,
-): Promise<CourseTreeUnit[]> {
+): Promise<CourseTree> {
   const base = options.baseUrl ?? DEFAULT_CONTENT_BASE_URL;
   const response = await fetcher(
     `${base}/course/api/course/${options.courseId}/default`,
@@ -90,12 +101,40 @@ export async function fetchCourseTree(
     },
   );
   const text = await response.text();
-  const json = JSON.parse(text) as { code?: number; course?: string; msg?: string };
+  const json = JSON.parse(text) as {
+    code?: number;
+    course?: string;
+    msg?: string;
+    version?: number | string;
+    publish_version?: number | string;
+  };
   if (json.course) {
     const parsed = JSON.parse(json.course) as
       | CourseTreeUnit[]
-      | { units?: CourseTreeUnit[] };
-    return Array.isArray(parsed) ? parsed : (parsed.units ?? []);
+      | {
+          units?: CourseTreeUnit[];
+          name?: string;
+          externalId?: string;
+          externalVersion?: string;
+          version?: string | number;
+        };
+    const course = Array.isArray(parsed) ? { units: parsed } : parsed;
+    const units = Array.isArray(course.units) ? course.units : [];
+    const version = course.version ?? json.publish_version ?? json.version;
+    return {
+      units,
+      ...(course.name ? { name: String(course.name) } : {}),
+      ...(course.externalId !== undefined && course.externalId !== null
+        ? { externalId: String(course.externalId) }
+        : {}),
+      ...(course.externalVersion !== undefined && course.externalVersion !== null
+        ? { externalVersion: String(course.externalVersion) }
+        : {}),
+      ...(version !== undefined ? { version: String(version) } : {}),
+      ...(json.publish_version !== undefined
+        ? { publishVersion: String(json.publish_version) }
+        : {}),
+    };
   }
   throw new Error(`fetchCourseTree: ${json.msg ?? `code ${json.code}`}`);
 }

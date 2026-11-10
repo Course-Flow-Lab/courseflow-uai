@@ -7,7 +7,8 @@ Courseflow 的 U校园ai版（Unipus）平台模块，提供课程目录、学�
 
 ## 功能
 
-- CAS 账号密码登录，reader token 通过官方页面交换
+- CAS 账号密码登录，取得 JWT 后按课程懒加载 reader token
+- 按账号读取课程列表；每个用户的课程、教材和单元互不影响
 - 课程树、单元进度回读
 - 视频和阅读节点完成
 - 章节题目：单选、多选、判断、填空、连线，以及 AI 评分的主观题
@@ -48,26 +49,30 @@ npm run serve
 
 ## 配置
 
-在 Courseflow 的模块设置里使用 `live` 模式：
+模块设置只放平台 URL，不需要课程、教材或单元 ID。所有配置都有默认值，留空即可：
 
 ```json
 {
   "source": "live",
-  "course_id": "<courseId>",
-  "course_name": "U校园课程",
-  "book_id": "<bookId>",
-  "book_version": "<bookVersionNumber>",
-  "target_url": "https://ucontent.unipus.cn/_ipublishpc_default/pc.html"
+  "portal_url": "https://uai.unipus.cn",
+  "content_url": "https://ucontent.unipus.cn",
+  "reader_url": "https://ipub.unipus.cn",
+  "player_url": "https://ucontent.unipus.cn/_ipublishpc_default/pc.html"
 }
 ```
 
-`course_id` 用于 reader token 交换，`book_id` 和 `book_version` 用于课程树与章节接口。
+- `source`：默认 `live`；`fixture` 是完全离线的合成课程，仅用于验证框架。
+- `portal_url`：课程列表与门户兜底，默认 `https://uai.unipus.cn`。
+- `content_url`：课程树与 reader token，默认 `https://ucontent.unipus.cn`。
+- `reader_url`：章节、试卷与提交接口，默认 `https://ipub.unipus.cn`。
+- `player_url`：浏览器换取 reader token 时打开的官方页面。
+
+登录后模块会按当前账号从平台读取课程列表；每个用户的课程、教材和单元互不影响。`bookId` / `bookVersionNumber` 从所选课程的课程树自动读取，不再写进模块配置。从旧版本升级后需要重新连接一次 U校园，让模块取得新的 JWT 登录态。
 
 可选配置：
 
-- `base_url`：默认 `https://ipub.unipus.cn`
-- `content_base_url`：默认 `https://ucontent.unipus.cn`
 - `browser_fallback`：设为 `false` 可关闭连线题浏览器兜底
+- `include_questions`：设为 `false` 可不在学习目录里展开章节题目
 
 宿主环境变量：
 

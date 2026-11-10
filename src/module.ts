@@ -9,11 +9,9 @@
  *   - 宿主服务冒烟：cw.net.fetch / cw.state / cw.session.identity / cw.log
  *
  * 登录：
- *   - source=fixture（默认）：离线桩，任意账号密码都直接 connected，用于验证框架。
- *   - source=live：真实 CAS 密码登录 + reader token 交换。
- *     live 需要在模块设置里提供 course_id（reader token 交换用）。
- *
- * 尚未实现：真实课程目录、章节/视频/阅读协议、考试。live 模式下 study.step 返回 needs_human。
+ *   - source=fixture：离线桩，任意账号密码都直接 connected，用于验证框架。
+ *   - source=live（默认）：CAS 密码登录取得 JWT，课程列表与 reader token
+ *     都按当前 session / 当前课程懒加载。模块设置只保留平台 URL。
  */
 import { createCipheriv, createHash, createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -72,29 +70,32 @@ const SETTINGS = (() => {
     return {};
   }
 })();
-const SOURCE = SETTINGS.source === 'live' ? 'live' : 'fixture';
-const TARGET_URL =
-  typeof SETTINGS.target_url === 'string'
-    ? SETTINGS.target_url
-    : 'https://ucontent.unipus.cn/_ipublishpc_default/pc.html';
-const COURSE_ID = typeof SETTINGS.course_id === 'string' ? SETTINGS.course_id : '';
-const COURSE_NAME =
-  typeof SETTINGS.course_name === 'string' && SETTINGS.course_name.trim()
-    ? SETTINGS.course_name.trim()
-    : 'U校园课程';
-const BOOK_ID = typeof SETTINGS.book_id === 'string' ? SETTINGS.book_id : '';
-const BOOK_VERSION = typeof SETTINGS.book_version === 'string' ? SETTINGS.book_version : '';
+const SOURCE = SETTINGS.source === 'fixture' ? 'fixture' : 'live';
 const IPUB_BASE =
-  typeof SETTINGS.base_url === 'string' && SETTINGS.base_url.trim()
-    ? SETTINGS.base_url.trim()
-    : 'https://ipub.unipus.cn';
+  typeof SETTINGS.reader_url === 'string' && SETTINGS.reader_url.trim()
+    ? SETTINGS.reader_url.trim().replace(/\/$/, '')
+    : typeof SETTINGS.base_url === 'string' && SETTINGS.base_url.trim()
+      ? SETTINGS.base_url.trim().replace(/\/$/, '')
+      : 'https://ipub.unipus.cn';
 const CONTENT_BASE =
-  typeof SETTINGS.content_base_url === 'string' && SETTINGS.content_base_url.trim()
-    ? SETTINGS.content_base_url.trim()
-    : 'https://ucontent.unipus.cn';
+  typeof SETTINGS.content_url === 'string' && SETTINGS.content_url.trim()
+    ? SETTINGS.content_url.trim().replace(/\/$/, '')
+    : typeof SETTINGS.content_base_url === 'string' && SETTINGS.content_base_url.trim()
+      ? SETTINGS.content_base_url.trim().replace(/\/$/, '')
+      : 'https://ucontent.unipus.cn';
+const PORTAL_BASE =
+  typeof SETTINGS.portal_url === 'string' && SETTINGS.portal_url.trim()
+    ? SETTINGS.portal_url.trim().replace(/\/$/, '')
+    : 'https://uai.unipus.cn';
+const TARGET_URL =
+  typeof SETTINGS.player_url === 'string' && SETTINGS.player_url.trim()
+    ? SETTINGS.player_url.trim()
+    : typeof SETTINGS.target_url === 'string' && SETTINGS.target_url.trim()
+      ? SETTINGS.target_url.trim()
+      : `${CONTENT_BASE}/_ipublishpc_default/pc.html`;
 
 const SSO_BASE = 'https://sso.unipus.cn';
-const UCONTENT_BASE = 'https://ucontent.unipus.cn';
+const UCONTENT_BASE = CONTENT_BASE;
 const LOGIN_AES_KEY = Buffer.from('8AD70B641C024C7ADA2ECD082EC0334F', 'hex');
 const LOGIN_AES_IV = Buffer.from('0102030405060708090A0B0C0D0E0F10', 'hex');
 const ANNOTATOR_SECRET = 'a824b379f126b8b7aa5e33dee83fb0a05aa7462c';
@@ -172,6 +173,150 @@ function decodeJwtExpiry(token) {
     return typeof claims.exp === 'number' ? claims.exp : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function decodeJwtPayload(token) {
+  try {
+    return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function jwtOpenId(token) {
+  const claims = decodeJwtPayload(token);
+  const value = claims?.openId ?? claims?.open_id ?? claims?.sub ?? claims?.boid;
+  return typeof value === 'string' ? value : '';
+}
+
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== 'object') return '';
+  const wanted = String(name).toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key).toLowerCase() === wanted) return String(value ?? '');
+  }
+  return '';
+}
+
+async function followRedirects(session, startUrl, maxHops = 8, headers = {}) {
+  let current = String(startUrl);
+  let response;
+  for (let hop = 0; hop < maxHops; hop += 1) {
+    response = await hostCall('cw.net.fetch', {
+      session,
+      method: 'GET',
+      url: current,
+      stage: 'read',
+      headers: {
+        ...BROWSER_HEADERS,
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        ...headers,
+      },
+    });
+    const location = headerValue(response?.headers, 'location');
+    if (!location) return { url: current, response };
+    current = new URL(location, current).toString();
+  }
+  return { url: current, response };
+}
+
+async function validateServiceTicket(session, service, ticket) {
+  const url =
+    `${SSO_BASE}/sso/serviceTicket/validate?service=${encodeURIComponent(service)}` +
+    `&ticket=${encodeURIComponent(ticket)}`;
+  const response = await hostCall('cw.net.fetch', {
+    session,
+    method: 'GET',
+    url,
+    stage: 'read',
+    headers: {
+      ...BROWSER_HEADERS,
+      accept: 'application/json, text/plain, */*',
+    },
+  });
+  const text = typeof response?.body === 'string' ? response.body : '';
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = undefined;
+  }
+  const code = json?.code;
+  const rs = json?.rs ?? json?.data ?? json;
+  const jwt = rs?.jwt;
+  if (typeof jwt !== 'string' || !jwt) {
+    log('warn', `serviceTicket/validate rejected: HTTP ${response?.status ?? '?'} code ${code ?? '?'} ${text.slice(0, 160)}`);
+    return null;
+  }
+  const expiresAt =
+    typeof rs?.jwtExpire === 'number'
+      ? rs.jwtExpire
+      : typeof rs?.jwtExpire === 'string'
+        ? Number(rs.jwtExpire) || undefined
+        : decodeJwtExpiry(jwt);
+  return {
+    jwt,
+    expiresAt,
+    refreshToken: typeof rs?.rt === 'string' && rs.rt ? rs.rt : undefined,
+    refreshExpiresAt: typeof rs?.rtExpire === 'number' ? rs.rtExpire : undefined,
+  };
+}
+
+async function browserReadJwt(session, url) {
+  let page;
+  try {
+    const opened = await hostCall('cw.browser.open', {
+      session,
+      url,
+      purpose: 'portal-token',
+    });
+    page = opened?.page;
+    if (!page) throw new Error('官方浏览器没有返回页面句柄');
+    const expression = `(async () => {
+      const read = () => {
+        let jwt = null;
+        let rt = null;
+        let expires = null;
+        try {
+          const raw = localStorage.getItem('PORTAL_STATE_PERSISTENT');
+          const parsed = raw ? JSON.parse(raw) : null;
+          jwt = parsed?.tokenInfo?.jwt ?? parsed?.Authorization ?? null;
+          rt = parsed?.tokenInfo?.rt ?? null;
+          expires = parsed?.tokenInfo?.jwtExpire ?? null;
+        } catch {}
+        if (!jwt) {
+          try {
+            const match = document.cookie.match(/(?:^|;\\s*)jwt=([^;]+)/);
+            if (match) jwt = decodeURIComponent(match[1]).trim();
+          } catch {}
+        }
+        return { href: location.href, jwt, rt, expires };
+      };
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const value = read();
+        if (value.jwt) return value;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return read();
+    })()`;
+    const result = await hostCall('cw.browser.evaluate', {
+      session,
+      page,
+      expression,
+      stage: 'read',
+    });
+    if (!result?.jwt) return null;
+    return {
+      jwt: String(result.jwt),
+      expiresAt:
+        typeof result.expires === 'number'
+          ? result.expires
+          : Number(result.expires) || decodeJwtExpiry(String(result.jwt)),
+      refreshToken: typeof result.rt === 'string' && result.rt ? result.rt : undefined,
+    };
+  } finally {
+    if (page) await hostCall('cw.browser.close', { session, page }).catch(() => {});
   }
 }
 
@@ -288,94 +433,43 @@ async function liveLogin(session, username, password) {
   const ticket = login.rs?.serviceTicket;
   const openId = login.rs?.openid;
   if (!ticket) throw new Error('SSO 未返回 serviceTicket');
-  if (!openId) throw new Error('SSO 未返回 openid');
 
+  // Redeeming the ticket sets the `jwt` cookie in the host cookie jar.  This is
+  // the same path the previous reader-token exchange used, so it is the most
+  // reliable way to obtain the SSO JWT.
   const redeem = service.includes('?') ? `${service}&ticket=${ticket}` : `${service}?ticket=${ticket}`;
   try {
-    await hostCall('cw.net.fetch', {
-      session,
-      method: 'GET',
-      url: redeem,
-      stage: 'read',
-      headers: {
-        ...BROWSER_HEADERS,
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
+    await followRedirects(session, redeem, 8);
   } catch (error) {
     // The redeem page can answer 403 while still setting the `jwt` cookie.
-    // The browser token exchange is the authoritative next step, so keep going.
-    if (error?.code !== 'platform_verification_required') throw error;
-    log('warn', 'ticket redeem returned 403; continuing with captured cookies');
+    log('warn', `ticket redeem failed: ${errorText(error)}`);
   }
 
-  if (!COURSE_ID) {
-    throw new Error('live 模式需要在模块设置里提供 course_id（reader token 交换用）');
-  }
-
-  const annotator = signAnnotatorToken(openId);
-  let page;
-  try {
-    const opened = await hostCall('cw.browser.open', {
-      session,
-      url: TARGET_URL,
-      purpose: 'reader-token',
-    });
-    page = opened?.page;
-    if (!page) throw new Error('官方浏览器没有返回页面句柄');
-
-    const expression = `(async () => {
-      const res = await fetch('/course/api/v3/ipublish/token', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json, text/plain, */*',
-          'x-annotator-auth-token': ${JSON.stringify(annotator)}
-        },
-        credentials: 'include',
-        body: JSON.stringify({ courseId: ${JSON.stringify(COURSE_ID)}, readerType: 2 })
-      });
-      const text = await res.text();
-      let payload = null;
-      try { payload = JSON.parse(text); } catch {}
-      return {
-        href: location.href,
-        status: res.status,
-        code: payload?.code ?? 'non-json',
-        token: payload?.data?.token ?? null,
-        message: payload?.message ?? text.slice(0, 160)
-      };
-    })()`;
-
-    let result = null;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      result = await hostCall('cw.browser.evaluate', {
-        session,
-        page,
-        expression,
-        stage: 'read',
-      });
-      if (result && result.loading !== true) break;
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    if (!result || result.loading === true) {
-      throw new Error('官方页面尚未就绪，无法交换 reader token');
-    }
-    if (result.status !== 200 || !result.token) {
-      throw new Error(`reader token 浏览器请求失败：HTTP ${result.status} @ ${result.href ?? ''} ${result.message ?? ''}`.trim());
-    }
-
-    return {
-      token: result.token,
-      openId,
-      expiresAt: decodeJwtExpiry(result.token),
-      displayName: username,
-    };
-  } finally {
-    if (page) {
-      await hostCall('cw.browser.close', { session, page }).catch(() => {});
+  let jwtInfo = await browserReadJwt(session, TARGET_URL).catch(() => null);
+  if (!jwtInfo?.jwt) {
+    try {
+      jwtInfo = await validateServiceTicket(session, service, ticket);
+    } catch (error) {
+      log('warn', `serviceTicket/validate failed: ${errorText(error)}`);
     }
   }
+  if (!jwtInfo?.jwt) {
+    jwtInfo = await browserReadJwt(session, PORTAL_BASE).catch(() => null);
+  }
+
+  if (!jwtInfo?.jwt) {
+    throw new Error('SSO 登录成功，但没有取得 JWT；请确认账号可以在 U校园网页端登录');
+  }
+  const resolvedOpenId = String(openId ?? '') || jwtOpenId(jwtInfo.jwt);
+  if (!resolvedOpenId) throw new Error('SSO 未返回 openid');
+
+  return {
+    jwt: jwtInfo.jwt,
+    openId: resolvedOpenId,
+    expiresAt: jwtInfo.expiresAt ?? decodeJwtExpiry(jwtInfo.jwt),
+    refreshToken: jwtInfo.refreshToken,
+    displayName: username,
+  };
 }
 
 async function authSubmit(params) {
@@ -394,7 +488,7 @@ async function authSubmit(params) {
     let identity;
     if (SOURCE === 'fixture') {
       identity = {
-        token: 'fixture-reader-token',
+        jwt: 'fixture-jwt',
         openId: 'unipus-fixture',
         displayName: 'U校园（离线）',
         expiresAt: undefined,
@@ -407,15 +501,16 @@ async function authSubmit(params) {
       display_name: identity.displayName,
       account_raw: identity.openId,
     };
-    challenge.token = identity.token;
     await hostCall('cw.state', {
       session: id,
       namespace: 'auth',
       key: 'session',
       value: {
-        token: identity.token,
+        jwt: identity.jwt,
         open_id: identity.openId,
+        display_name: identity.displayName,
         expires_at: identity.expiresAt ?? null,
+        refresh_token: identity.refreshToken ?? null,
         source: SOURCE,
         connected_at: Date.now(),
       },
@@ -456,8 +551,56 @@ async function authVerify(params) {
       connected_at: identity?.connected_at ?? null,
     };
   } catch {
-    return { display_name: 'U校园', account_raw: '' };
+    try {
+      const stored = await hostCall('cw.state', {
+        session: params.session,
+        namespace: 'auth',
+        key: 'session',
+      });
+      const value = (stored as any)?.value;
+      return {
+        display_name: value?.display_name ?? 'U校园',
+        account_raw: value?.open_id ?? '',
+        connected_at: value?.connected_at ?? null,
+      };
+    } catch {
+      return { display_name: 'U校园', account_raw: '' };
+    }
   }
+}
+
+async function refreshPortalJwt(session, refreshToken) {
+  const response = await hostCall('cw.net.fetch', {
+    session,
+    method: 'POST',
+    url: `${SSO_BASE}/sso/4.0/sso/refresh_jwt`,
+    encoding: 'json',
+    stage: 'read',
+    headers: {
+      ...BROWSER_HEADERS,
+      origin: SSO_BASE,
+      accept: 'application/json, text/plain, */*',
+    },
+    body: { rt: refreshToken },
+  });
+  const text = typeof response?.body === 'string' ? response.body : '';
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = undefined;
+  }
+  const rs = json?.rs ?? json?.data ?? json;
+  if (!rs?.jwt) return null;
+  return {
+    jwt: String(rs.jwt),
+    expires_at:
+      typeof rs.jwtExpire === 'number'
+        ? rs.jwtExpire
+        : Number(rs.jwtExpire) || decodeJwtExpiry(String(rs.jwt)) || null,
+    refresh_token: typeof rs.rt === 'string' && rs.rt ? rs.rt : refreshToken,
+    refresh_expires_at: typeof rs.rtExpire === 'number' ? rs.rtExpire : null,
+  };
 }
 
 async function authKeepalive(params) {
@@ -468,8 +611,24 @@ async function authKeepalive(params) {
       namespace: 'auth',
       key: 'session',
     });
-    if (!state?.value?.token) return { ok: false, reason: 'no-token' };
-    return { ok: true, mode: SOURCE, expires_at: state.value.expires_at ?? null };
+    let value = (state as any)?.value;
+    if (!value?.jwt) return { ok: false, reason: 'no-token' };
+    const expiresAt = Number(value.expires_at ?? 0);
+    if (expiresAt > 0 && expiresAt * 1000 < Date.now() + 5 * 60 * 1000 && value.refresh_token) {
+      const refreshed = await refreshPortalJwt(params.session, value.refresh_token).catch(() => null);
+      if (refreshed) {
+        value = { ...value, ...refreshed, connected_at: value.connected_at };
+        await hostCall('cw.state', {
+          session: params.session,
+          namespace: 'auth',
+          key: 'session',
+          value,
+        });
+      } else {
+        return { ok: false, reason: 'jwt-expired' };
+      }
+    }
+    return { ok: true, mode: SOURCE, expires_at: value.expires_at ?? null };
   } catch (error) {
     return { ok: false, reason: error.message ?? 'state-unavailable' };
   }
@@ -623,13 +782,318 @@ function baseHeaders(token: string): Record<string, string> {
 async function readAuth(session: string): Promise<any> {
   const stored = await hostCall('cw.state', { session, namespace: 'auth', key: 'session' });
   const value = (stored as any)?.value;
-  if (!value?.token) throw { code: 'platform_login_expired', message: '请先连接 U校园' };
+  if (!value?.jwt || !value?.open_id) {
+    throw { code: 'platform_login_expired', message: '请先连接 U校园，当前登录态已失效' };
+  }
   return value;
 }
 
-function courseConfig() {
-  if (!COURSE_ID || !BOOK_ID || !BOOK_VERSION) return null;
-  return { id: COURSE_ID, name: COURSE_NAME, bookId: BOOK_ID, bookVersion: BOOK_VERSION };
+const COURSE_LIST_TTL_MS = 60_000;
+const courseListCache = new Map<string, { at: number; value: any[] }>();
+
+const COURSE_GROUP_ORDER = ['CLASS_COURSE', 'SCHOOL_INNER', 'PERSONAL'];
+
+function mapBookshelf(groups: any): any[] {
+  if (!groups || typeof groups !== 'object') return [];
+  const courses: any[] = [];
+  const seen = new Set<string>();
+  const groupNames = [
+    ...COURSE_GROUP_ORDER,
+    ...Object.keys(groups).filter((name) => !COURSE_GROUP_ORDER.includes(name) && name !== 'EXPIRED'),
+  ];
+  for (const groupName of groupNames) {
+    const items = Array.isArray(groups[groupName]) ? groups[groupName] : [];
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const id = String(
+        item.resourceId ??
+          item.resource_id ??
+          item.courseId ??
+          item.course_id ??
+          item.classCourseId ??
+          item.class_course_id ??
+          item.id ??
+          '',
+      ).trim();
+      if (!id || seen.has(id)) continue;
+      const recruitId = String(
+        item.classCourseId ??
+          item.class_course_id ??
+          item.classId ??
+          item.class_id ??
+          item.clazzId ??
+          item.resourceId ??
+          item.resource_id ??
+          id,
+      ).trim() || id;
+      const name =
+        String(item.name ?? item.title ?? item.tutorialName ?? item.resourceName ?? '').trim() || id;
+      seen.add(id);
+      courses.push({
+        id,
+        recruit_id: recruitId,
+        name,
+        kind: 'shared',
+        kind_label: 'U校园课程',
+        family: 'shared',
+        progress: null,
+        outline_available: true,
+        ...(recruitId !== id ? { class_course_id: recruitId } : {}),
+        ...(item.instanceId ? { instance_id: String(item.instanceId) } : {}),
+        ...(Array.isArray(item.classCourses)
+          ? {
+              class_courses: item.classCourses
+                .filter((entry: any) => entry && entry.courseId !== undefined)
+                .map((entry: any) => ({
+                  course_id: String(entry.courseId),
+                  ...(entry.classId !== undefined ? { class_id: String(entry.classId) } : {}),
+                  ...(entry.courseName ? { course_name: String(entry.courseName) } : {}),
+                  ...(entry.className ? { class_name: String(entry.className) } : {}),
+                })),
+            }
+          : {}),
+      });
+    }
+  }
+  return courses;
+}
+
+async function fetchBookshelf(session: string, jwt: string): Promise<any> {
+  const response = await hostCall('cw.net.fetch', {
+    session,
+    method: 'GET',
+    url: `${PORTAL_BASE}/api/cmgt/course/my/bookshelf`,
+    stage: 'read',
+    headers: {
+      ...BROWSER_HEADERS,
+      authorization: jwt,
+      accept: 'application/json, text/plain, */*',
+    },
+  });
+  if (response?.status === 401 || response?.status === 403) {
+    throw { code: 'platform_login_expired', message: 'U校园登录态已失效，请重新连接' };
+  }
+  const text = typeof response?.body === 'string' ? response.body : '';
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`课程列表返回非 JSON（HTTP ${response?.status ?? '?'}）`);
+  }
+  const code = json?.code;
+  if (code !== 0 && code !== 1 && code !== 200 && code !== '0' && code !== '1' && code !== '200') {
+    throw new Error(`课程列表失败：code ${code ?? '?'} ${json?.msg ?? json?.message ?? text.slice(0, 160)}`);
+  }
+  const value = json?.value ?? json?.data?.value ?? json?.data ?? {};
+  const groups = value?.groups ?? value;
+  if (!groups || typeof groups !== 'object') throw new Error('课程列表缺少 groups');
+  return groups;
+}
+
+async function loadCourses(session: string): Promise<any[]> {
+  const cached = courseListCache.get(session);
+  if (cached && Date.now() - cached.at < COURSE_LIST_TTL_MS) return cached.value;
+  const auth = await readAuth(session);
+  let groups: any;
+  try {
+    groups = await fetchBookshelf(session, auth.jwt);
+  } catch (error) {
+    if (error?.code === 'platform_login_expired') throw error;
+    const stored = await hostCall('cw.state', {
+      session,
+      namespace: 'unipus-v1',
+      key: 'courses',
+    }).catch(() => null);
+    const fallback = (stored as any)?.value;
+    const cachedCourses = fallback?.courses;
+    if (
+      fallback?.open_id === auth.open_id &&
+      Array.isArray(cachedCourses) &&
+      cachedCourses.length > 0
+    ) {
+      courseListCache.set(session, { at: Date.now(), value: cachedCourses });
+      return cachedCourses;
+    }
+    throw error;
+  }
+  const courses = mapBookshelf(groups);
+  courseListCache.set(session, { at: Date.now(), value: courses });
+  await hostCall('cw.state', {
+    session,
+    namespace: 'unipus-v1',
+    key: 'courses',
+    value: { at: Date.now(), open_id: auth.open_id, courses, groups },
+  }).catch(() => {});
+  return courses;
+}
+
+function readerTokenExpired(value: any): boolean {
+  const expiresAt = Number(value?.expires_at ?? 0);
+  return expiresAt > 0 && expiresAt * 1000 < Date.now() + 60_000;
+}
+
+async function exchangeReaderTokenHttp(session: string, auth: any, courseId: string): Promise<any> {
+  const response = await hostCall('cw.net.fetch', {
+    session,
+    method: 'POST',
+    url: `${CONTENT_BASE}/course/api/v3/ipublish/token`,
+    encoding: 'json',
+    stage: 'read',
+    headers: {
+      ...BROWSER_HEADERS,
+      authorization: auth.jwt,
+      'x-annotator-auth-token': signAnnotatorToken(auth.open_id),
+      accept: 'application/json, text/plain, */*',
+    },
+    body: { courseId, readerType: 2 },
+  });
+  const text = typeof response?.body === 'string' ? response.body : '';
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`reader token 返回非 JSON（HTTP ${response?.status ?? '?'}）`);
+  }
+  const token = json?.data?.token;
+  if ((json?.code !== 0 && json?.code !== 200 && json?.code !== '0') || !token) {
+    throw new Error(
+      `reader token 失败：code ${json?.code ?? '?'} ${json?.message ?? text.slice(0, 160)}`,
+    );
+  }
+  return { token: String(token), expires_at: decodeJwtExpiry(String(token)) ?? null };
+}
+
+async function exchangeReaderTokenBrowser(session: string, auth: any, courseId: string): Promise<any> {
+  const annotator = signAnnotatorToken(auth.open_id);
+  let page;
+  try {
+    const opened = await hostCall('cw.browser.open', {
+      session,
+      url: TARGET_URL,
+      purpose: 'reader-token',
+    });
+    page = opened?.page;
+    if (!page) throw new Error('官方浏览器没有返回页面句柄');
+    const expression = `(async () => {
+      const res = await fetch('/course/api/v3/ipublish/token', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/plain, */*',
+          authorization: ${JSON.stringify(auth.jwt)},
+          'x-annotator-auth-token': ${JSON.stringify(annotator)}
+        },
+        credentials: 'include',
+        body: JSON.stringify({ courseId: ${JSON.stringify(courseId)}, readerType: 2 })
+      });
+      const text = await res.text();
+      let payload = null;
+      try { payload = JSON.parse(text); } catch {}
+      return {
+        href: location.href,
+        status: res.status,
+        code: payload?.code ?? 'non-json',
+        token: payload?.data?.token ?? null,
+        message: payload?.message ?? text.slice(0, 160)
+      };
+    })()`;
+    let result = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      result = await hostCall('cw.browser.evaluate', {
+        session,
+        page,
+        expression,
+        stage: 'read',
+      });
+      if (result && result.loading !== true) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (!result || result.loading === true || result.status !== 200 || !result.token) {
+      throw new Error(
+        `reader token 浏览器请求失败：HTTP ${result?.status ?? '?'} @ ${result?.href ?? ''} ${result?.message ?? ''}`.trim(),
+      );
+    }
+    return {
+      token: String(result.token),
+      expires_at: decodeJwtExpiry(String(result.token)) ?? null,
+    };
+  } finally {
+    if (page) await hostCall('cw.browser.close', { session, page }).catch(() => {});
+  }
+}
+
+async function readerTokenFor(session: string, auth: any, courseId: string): Promise<string> {
+  const key = `reader/${courseId}`;
+  const stored = await hostCall('cw.state', { session, namespace: 'auth', key });
+  const value = (stored as any)?.value;
+  if (
+    value?.token &&
+    value.open_id === auth.open_id &&
+    !readerTokenExpired(value)
+  ) {
+    return String(value.token);
+  }
+
+  let tokenValue: any;
+  try {
+    tokenValue = await exchangeReaderTokenHttp(session, auth, courseId);
+  } catch (error) {
+    log('warn', `reader token http failed for ${courseId}: ${errorText(error)}`);
+    tokenValue = await exchangeReaderTokenBrowser(session, auth, courseId);
+  }
+  await hostCall('cw.state', {
+    session,
+    namespace: 'auth',
+    key,
+    value: { ...tokenValue, open_id: auth.open_id, at: Date.now() },
+  });
+  return String(tokenValue.token);
+}
+
+async function loadCourse(session: string, publicCourse: any): Promise<any> {
+  const classCourseIds = Array.isArray(publicCourse?.class_courses)
+    ? publicCourse.class_courses.flatMap((entry: any) => [entry?.course_id, entry?.class_id])
+    : [];
+  const candidates = [
+    publicCourse?.instance_id,
+    publicCourse?.id,
+    publicCourse?.class_course_id,
+    publicCourse?.recruit_id,
+    ...classCourseIds,
+  ]
+    .map((value) => String(value ?? '').trim())
+    .filter((value, index, list) => value && list.indexOf(value) === index);
+  if (candidates.length === 0) throw { code: 'invalid_params', message: '请先选择课程' };
+  const base = await readAuth(session);
+  const fetcher: any = hostFetchFor(session);
+  let lastError;
+  for (const courseId of candidates) {
+    try {
+      const token = await readerTokenFor(session, base, courseId);
+      const auth = { ...base, token };
+      const tree = await fetchCourseTree(
+        { token, cookie: '', courseId, baseUrl: CONTENT_BASE },
+        fetcher,
+      );
+      const cfg = {
+        id: courseId,
+        name: String(publicCourse?.name ?? tree?.name ?? 'U校园课程'),
+        bookId: String(tree?.externalId ?? ''),
+        bookVersion: String(tree?.externalVersion ?? ''),
+      };
+      if (!cfg.bookId || !cfg.bookVersion) {
+        throw {
+          code: 'not_found',
+          message: '该课程不是可用的数字教材（缺少 bookId/bookVersion），暂不支持',
+        };
+      }
+      return { auth, cfg, tree, fetcher };
+    } catch (error) {
+      lastError = lastError ?? error;
+      log('warn', `loadCourse ${courseId} failed: ${errorText(error)}`);
+    }
+  }
+  throw lastError;
 }
 
 function treeUnitNumber(treeUnit: any, index: number): number {
@@ -731,7 +1195,7 @@ async function getChapterStructure(
   cfg: any,
   chapterId: string,
 ): Promise<any> {
-  const key = `${cfg.bookId}:${chapterId}`;
+  const key = `${cfg.bookId}:${cfg.bookVersion}:${chapterId}`;
   const cached = structureCache.get(key);
   if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.value;
   const value = await fetchChapterStructure(
@@ -2050,6 +2514,10 @@ async function studyQuestionStep(
 
 const paperCache = new Map<string, any>();
 
+function paperCacheKey(bookId: string, bookVersion: string, paperId: string): string {
+  return `${bookId}:${bookVersion}:${paperId}`;
+}
+
 function paperReferer(meta: any): string {
   return buildChapterReferer({
     bookId: meta.bookId,
@@ -2059,11 +2527,14 @@ function paperReferer(meta: any): string {
 }
 
 async function refreshPapers(session: string, cfg: any, auth: any, fetcher: any): Promise<void> {
+  for (const key of [...paperCache.keys()]) {
+    if (key.startsWith(`${cfg.bookId}:${cfg.bookVersion}:`)) paperCache.delete(key);
+  }
   const tree = await fetchCourseTree(
     { token: auth.token, cookie: '', courseId: cfg.id, baseUrl: CONTENT_BASE },
     fetcher,
   );
-  const treeLinks = collectQuizLinks(tree);
+  const treeLinks = collectQuizLinks(tree.units);
   const chapters = await fetchChapterList(fetcher, auth.token, cfg);
   const collected: Array<{ paperId: string; paperType: number; chapterId: string; chapterName: string }> = [];
 
@@ -2143,13 +2614,14 @@ async function refreshPapers(session: string, cfg: any, auth: any, fetcher: any)
       log('warn', `paper version ${paperId} failed: ${errorText(error)}`);
     }
     if (paperType !== 2 && paperType !== 3) paperType = 2;
-    paperCache.set(paperId, {
+    paperCache.set(paperCacheKey(cfg.bookId, cfg.bookVersion, paperId), {
       paperId,
       paperType,
       paperName,
       versionNumber,
       chapterId: entry.chapterId,
       chapterName: entry.chapterName,
+      courseId: cfg.id,
       bookId: cfg.bookId,
       bookVersion: cfg.bookVersion,
     });
@@ -2159,13 +2631,11 @@ async function refreshPapers(session: string, cfg: any, auth: any, fetcher: any)
 async function catalogPapers(params: any) {
   if (SOURCE !== 'live') return { papers: [] };
   const session = String(params.session ?? '');
-  const cfg = courseConfig();
-  if (!cfg) throw { code: 'invalid_params', message: '请在模块设置里配置 course_id / book_id / book_version' };
-  if (params.course?.id && params.course.id !== cfg.id) return { papers: [] };
-  const auth = await readAuth(session);
-  const fetcher: any = hostFetchFor(session);
+  const { auth, cfg, fetcher } = await loadCourse(session, params.course);
   await refreshPapers(session, cfg, auth, fetcher);
-  const metas = [...paperCache.values()];
+  const metas = [...paperCache.values()].filter(
+    (meta) => meta.bookId === cfg.bookId && meta.bookVersion === cfg.bookVersion,
+  );
   const statuses = new Map<
     string,
     { done: boolean; score: number | null; unknown: boolean }
@@ -2174,18 +2644,20 @@ async function catalogPapers(params: any) {
     const chunk = metas.slice(index, index + 4);
     const results = await Promise.all(
       chunk.map((meta) =>
-        readPaperStatus(fetcher, auth, meta).catch(() => ({
+        readPaperStatus(fetcher, auth, meta, session).catch(() => ({
           done: false,
           score: null,
           unknown: true,
         })),
       ),
     );
-    chunk.forEach((meta, offset) => statuses.set(meta.paperId, results[offset]!));
+    chunk.forEach((meta, offset) =>
+      statuses.set(paperCacheKey(meta.bookId, meta.bookVersion, meta.paperId), results[offset]!),
+    );
   }
   return {
     papers: metas.map((meta) => {
-      const status = statuses.get(meta.paperId) ?? {
+      const status = statuses.get(paperCacheKey(meta.bookId, meta.bookVersion, meta.paperId)) ?? {
         done: false,
         score: null,
         unknown: false,
@@ -2353,8 +2825,8 @@ const paperStatusCache = new Map<
   { done: boolean; score: number | null; unknown: boolean; at: number }
 >();
 
-function paperStatusKey(meta: any): string {
-  return `${meta.bookId}:${meta.paperId}:${meta.paperType}`;
+function paperStatusKey(meta: any, session: string): string {
+  return `${session}:${meta.bookId}:${meta.bookVersion}:${meta.paperId}:${meta.paperType}`;
 }
 
 /** Latest attempt for a paper (`POST /paper/instance/getLatestPaperInstance`). */
@@ -2398,8 +2870,9 @@ async function readPaperStatus(
   fetcher: any,
   auth: any,
   meta: any,
+  session: string,
 ): Promise<{ done: boolean; score: number | null; unknown: boolean }> {
-  const key = paperStatusKey(meta);
+  const key = paperStatusKey(meta, session);
   const cached = paperStatusCache.get(key);
   if (
     cached &&
@@ -2439,20 +2912,18 @@ async function readPaperStatus(
 
 async function examOpen(params: any) {
   const session = String(params.session ?? '');
-  const cfg = courseConfig();
-  if (!cfg) throw { code: 'invalid_params', message: '请在模块设置里配置 course_id / book_id / book_version' };
-  const auth = await readAuth(session);
-  const fetcher: any = hostFetchFor(session);
+  const { auth, cfg, fetcher } = await loadCourse(session, params.course);
   const paperId = String(params.paper_id ?? '');
-  let meta = paperCache.get(paperId);
+  let meta = paperCache.get(paperCacheKey(cfg.bookId, cfg.bookVersion, paperId));
   if (!meta) {
     await refreshPapers(session, cfg, auth, fetcher);
-    meta = paperCache.get(paperId);
+    meta = paperCache.get(paperCacheKey(cfg.bookId, cfg.bookVersion, paperId));
   }
   if (!meta) throw { code: 'not_found', message: '试卷不存在' };
+  meta = { ...meta, courseId: cfg.id };
 
   const forceNew = params.force_new === true;
-  const statusKey = paperStatusKey(meta);
+  const statusKey = paperStatusKey(meta, session);
   let paperData: any;
   // Only Unit Test attempts are resumed. A challenge paper is always a new
   // attempt (unicheat's quiz behaves the same), so a stale/expired challenge
@@ -2531,8 +3002,6 @@ async function examOpen(params: any) {
 
 async function examWrite(params: any) {
   const session = String(params.session ?? '');
-  const auth = await readAuth(session);
-  const fetcher: any = hostFetchFor(session);
   const attemptId = String(params.attempt_id ?? '');
   const stored = await hostCall('cw.state', {
     session,
@@ -2541,6 +3010,11 @@ async function examWrite(params: any) {
   });
   const state = (stored as any)?.value;
   if (!state?.paperData || !state?.meta) throw { code: 'not_found', message: '试卷实例不存在' };
+  const courseId = String(state.meta.courseId ?? params.course?.id ?? '');
+  if (!courseId) throw { code: 'not_found', message: '试卷缺少课程信息，请重新打开试卷' };
+  const baseAuth = await readAuth(session);
+  const auth = { ...baseAuth, token: await readerTokenFor(session, baseAuth, courseId) };
+  const fetcher: any = hostFetchFor(session);
 
   const incoming = params.answers && typeof params.answers === 'object' ? params.answers : {};
   const merged = { ...(state.answers ?? {}), ...incoming };
@@ -2657,8 +3131,6 @@ async function examWrite(params: any) {
 
 async function examReadback(params: any) {
   const session = String(params.session ?? '');
-  const auth = await readAuth(session);
-  const fetcher: any = hostFetchFor(session);
   const attemptId = String(params.attempt_id ?? '');
   const stored = await hostCall('cw.state', {
     session,
@@ -2667,10 +3139,15 @@ async function examReadback(params: any) {
   });
   const state = (stored as any)?.value;
   if (!state?.paperData) throw { code: 'not_found', message: '试卷实例不存在' };
+  const courseId = String(state.meta?.courseId ?? params.course?.id ?? '');
+  if (!courseId) throw { code: 'not_found', message: '试卷缺少课程信息，请重新打开试卷' };
+  const baseAuth = await readAuth(session);
+  const auth = { ...baseAuth, token: await readerTokenFor(session, baseAuth, courseId) };
+  const fetcher: any = hostFetchFor(session);
   const score = await readPaperScore(fetcher, auth, state.paperData);
   const userScore = score.paperScore?.userScore ?? score.totalScore ?? null;
   if (score.status === 1) {
-    paperStatusCache.set(paperStatusKey(state.meta), {
+    paperStatusCache.set(paperStatusKey(state.meta ?? {}, session), {
       done: true,
       score: userScore,
       unknown: false,
@@ -2715,28 +3192,8 @@ async function examReview(params: any) {
 async function catalogCourses(params) {
   const session = String(params.session ?? '');
   if (SOURCE === 'live') {
-    const cfg = courseConfig();
-    if (!cfg) {
-      throw {
-        code: 'invalid_params',
-        message: '请在模块设置里配置 course_id / book_id / book_version',
-      };
-    }
-    await readAuth(session);
-    return {
-      courses: [
-        {
-          id: cfg.id,
-          recruit_id: cfg.id,
-          name: cfg.name,
-          kind: 'shared',
-          kind_label: '共享课',
-          family: 'shared',
-          progress: null,
-          outline_available: true,
-        },
-      ],
-    };
+    const courses = await loadCourses(session);
+    return { courses };
   }
   return {
     courses: [
@@ -2790,21 +3247,7 @@ async function catalogUnits(params) {
   }
 
   const session = String(params.session ?? '');
-  const cfg = courseConfig();
-  if (!cfg) {
-    throw {
-      code: 'invalid_params',
-      message: '请在模块设置里配置 course_id / book_id / book_version',
-    };
-  }
-  if (params.course?.id !== cfg.id) throw { code: 'not_found', message: '课程不存在' };
-
-  const auth = await readAuth(session);
-  const fetcher: any = hostFetchFor(session);
-  const tree = await fetchCourseTree(
-    { token: auth.token, cookie: '', courseId: cfg.id, baseUrl: CONTENT_BASE },
-    fetcher,
-  );
+  const { auth, cfg, tree, fetcher } = await loadCourse(session, params.course);
   const chapters = await fetchChapterList(fetcher, auth.token, cfg);
 
   let durations = new Map<string, any>();
@@ -2823,8 +3266,8 @@ async function catalogUnits(params) {
   }
 
   const units: any[] = [];
-  for (let index = 0; index < tree.length; index += 1) {
-    const treeUnit = tree[index];
+  for (let index = 0; index < tree.units.length; index += 1) {
+    const treeUnit = tree.units[index];
     const chapter = chapterForUnit(treeUnit, chapters, index);
     const chapterId = chapter?.id ? String(chapter.id) : '';
     const chapterName = String(treeUnit?.name ?? chapter?.name ?? '');
@@ -2949,37 +3392,23 @@ async function studyStep(params) {
   }
 
   const session = String(params.session ?? '');
-  const cfg = courseConfig();
-  if (!cfg) {
-    throw {
-      code: 'invalid_params',
-      message: '请在模块设置里配置 course_id / book_id / book_version',
-    };
-  }
+  const { auth, cfg, tree, fetcher } = await loadCourse(session, params.course);
   const unit = params.unit ?? {};
   const rawId = String(unit.id ?? '');
   if (rawId.startsWith('q::')) {
-    const auth = await readAuth(session);
-    const fetcher: any = hostFetchFor(session);
     return studyQuestionStep(params, session, cfg, auth, fetcher, rawId);
   }
   const groupId = rawId.split('::')[0];
   if (!groupId) throw { code: 'invalid_params', message: '缺少单元 id' };
 
-  const auth = await readAuth(session);
-  const fetcher: any = hostFetchFor(session);
-  const tree = await fetchCourseTree(
-    { token: auth.token, cookie: '', courseId: cfg.id, baseUrl: CONTENT_BASE },
-    fetcher,
-  );
-  const found = findGroup(tree, groupId);
+  const found = findGroup(tree.units, groupId);
   if (!found) throw { code: 'not_found', message: '课程树里找不到该单元' };
 
   const base = String(found.group.base ?? unit.lesson_id ?? '');
   const anchor = String(found.group.externalNodeId ?? unit.video_id ?? '');
   if (!anchor) throw { code: 'invalid_params', message: '单元缺少 anchor' };
 
-  const index = Math.max(0, tree.indexOf(found.unit));
+  const index = Math.max(0, tree.units.indexOf(found.unit));
   const chapters = await fetchChapterList(fetcher, auth.token, cfg);
   const chapter = chapterForUnit(found.unit, chapters, index);
   if (!chapter?.id) throw { code: 'not_found', message: '找不到对应章节' };
