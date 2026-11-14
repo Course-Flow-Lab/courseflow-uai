@@ -1863,6 +1863,316 @@ function buildSamplePdf(text = "Smart city design notes") {
   return new TextEncoder().encode(body);
 }
 
+// src/bank.ts
+var hostCall = null;
+var hostLog = () => {
+};
+function configureBank(call, log2) {
+  hostCall = call;
+  hostLog = log2;
+}
+function courseScope(cfg) {
+  return `${String(cfg?.bookId ?? "")}/${String(cfg?.bookVersion ?? "")}`;
+}
+var clean = (value) => String(value ?? "").normalize("NFC").replace(/\s+/gu, " ").trim();
+var KIND_BY_TYPE = {
+  single_choice: "single",
+  single: "single",
+  multiple_choice: "multiple",
+  multiple: "multiple",
+  true_false: "judge",
+  judge: "judge",
+  fill_blanks: "blank",
+  fill_blanks_choice: "blank"
+};
+function rawTypeOf(question) {
+  const raw = String(question?.rawType ?? question?.type ?? "").trim().toLowerCase();
+  return raw.endsWith("_group") ? raw.slice(0, -"_group".length) : raw;
+}
+function bankKindOf(question) {
+  return KIND_BY_TYPE[rawTypeOf(question)] ?? null;
+}
+function optionSource(question) {
+  return Array.isArray(question?.options) ? question.options : [];
+}
+function optionIdOf2(option, index = 0) {
+  return String(option?.id ?? option?.optionId ?? option?.value ?? index) || String(index);
+}
+function blankCountOf(question) {
+  const raw = Number(question?.blankCount) || (Array.isArray(question?.childIds) ? question.childIds.length : 0) || 1;
+  return Math.min(200, Math.max(1, Math.trunc(raw)));
+}
+function toBankQuestion(question) {
+  const kind = bankKindOf(question);
+  if (!kind) return null;
+  const text = String(question?.stem ?? "").trim();
+  if (!text) return null;
+  const options = [];
+  const seenIds = /* @__PURE__ */ new Set();
+  const seenTexts = /* @__PURE__ */ new Set();
+  for (const [index, option] of optionSource(question).entries()) {
+    const optionText2 = String(option?.text ?? "").trim();
+    if (!optionText2) return null;
+    const textKey = clean(optionText2);
+    if (seenTexts.has(textKey)) return null;
+    seenTexts.add(textKey);
+    const base = optionIdOf2(option, index);
+    let id = base;
+    let suffix = 1;
+    while (seenIds.has(id)) {
+      id = `${base}#${suffix}`;
+      suffix += 1;
+    }
+    seenIds.add(id);
+    options.push({ id, text: optionText2 });
+  }
+  if ((kind === "single" || kind === "multiple" || kind === "judge") && options.length === 0) {
+    return null;
+  }
+  const passage = String(question?.passage ?? "").trim();
+  return {
+    kind,
+    text,
+    options,
+    ...kind === "blank" ? { blanks: blankCountOf(question) } : {},
+    ...passage ? { context: passage } : {}
+  };
+}
+var TRUE_WORDS2 = /* @__PURE__ */ new Set(["true", "t", "yes", "y", "\u6B63\u786E", "\u5BF9", "\u662F", "\u221A"]);
+var FALSE_WORDS2 = /* @__PURE__ */ new Set(["false", "f", "no", "n", "\u9519\u8BEF", "\u9519", "\u5426", "\xD7", "x"]);
+function truthOf(value) {
+  const text = clean(value).toLowerCase();
+  if (!text) return null;
+  if (TRUE_WORDS2.has(text)) return "true";
+  if (FALSE_WORDS2.has(text)) return "false";
+  return null;
+}
+function optionTruth(option) {
+  return truthOf(option?.text) ?? truthOf(option?.label);
+}
+function rawValues(raw) {
+  if (Array.isArray(raw)) return raw.flatMap((value) => rawValues(value));
+  if (raw == null) return [];
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed.flatMap((value) => rawValues(value));
+      } catch {
+      }
+    }
+    return trimmed ? [trimmed] : [];
+  }
+  return [String(raw)];
+}
+function matchOptionId(question, token) {
+  const value = clean(token);
+  if (!value) return null;
+  const lower = value.toLowerCase();
+  const options = optionSource(question);
+  const raw = String(token).trim();
+  const byIdIndex = options.findIndex((option, index) => optionIdOf2(option, index) === raw);
+  if (byIdIndex >= 0) return optionIdOf2(options[byIdIndex], byIdIndex);
+  const byLabelIndex = options.findIndex(
+    (option) => clean(option?.label).toLowerCase() === lower
+  );
+  if (byLabelIndex >= 0) return optionIdOf2(options[byLabelIndex], byLabelIndex);
+  const byTextIndex = options.findIndex((option) => clean(option?.text) === value);
+  if (byTextIndex >= 0) return optionIdOf2(options[byTextIndex], byTextIndex);
+  return null;
+}
+function choiceAnswer(question, kind, raw) {
+  const tokens2 = rawValues(raw).map((value) => value.trim()).filter(Boolean);
+  if (tokens2.length === 0) return null;
+  const ids = [];
+  for (const token of tokens2) {
+    const direct = matchOptionId(question, token);
+    if (direct) {
+      ids.push(direct);
+      continue;
+    }
+    const parts = token.split(/[\s,，、;；/|]+/).map((part) => part.trim()).filter(Boolean);
+    if (parts.length > 1) {
+      const mapped = parts.map((part) => matchOptionId(question, part));
+      if (mapped.every((id) => Boolean(id))) {
+        ids.push(...mapped);
+        continue;
+      }
+    }
+    const chars = [...token];
+    if (chars.length > 1) {
+      const mapped = chars.map((char) => matchOptionId(question, char));
+      if (mapped.every((id) => Boolean(id))) {
+        ids.push(...mapped);
+        continue;
+      }
+    }
+    return null;
+  }
+  const unique = [...new Set(ids)];
+  if (kind === "single") return unique.length === 1 ? unique : null;
+  return unique.length > 0 ? unique : null;
+}
+function judgeAnswer(question, raw) {
+  const tokens2 = rawValues(raw).map((value) => value.trim()).filter(Boolean);
+  if (tokens2.length !== 1) return null;
+  const token = tokens2[0];
+  const direct = truthOf(token);
+  if (direct) return direct;
+  const options = optionSource(question);
+  const byId = options.find(
+    (option, index) => optionIdOf2(option, index) === String(token).trim()
+  );
+  if (byId) return optionTruth(byId);
+  const lower = token.toLowerCase();
+  for (const option of options) {
+    if (clean(option?.label).toLowerCase() === lower || clean(option?.text).toLowerCase() === lower) {
+      return optionTruth(option);
+    }
+  }
+  return null;
+}
+function blankAnswer(question, raw) {
+  const expected = blankCountOf(question);
+  let values = rawValues(raw).map((value) => String(value).trim());
+  if (values.length === 1 && expected > 1) {
+    values = values[0].split(/\r?\n/).map((value) => value.trim());
+  }
+  if (values.length !== expected || values.some((value) => !value)) return null;
+  return values;
+}
+function platformKeyToBankAnswer(question, raw) {
+  const kind = bankKindOf(question);
+  if (!kind) return null;
+  if (kind === "single" || kind === "multiple") return choiceAnswer(question, kind, raw);
+  if (kind === "judge") {
+    const truth = judgeAnswer(question, raw);
+    return truth ? [truth] : null;
+  }
+  return blankAnswer(question, raw);
+}
+function textsToBankAnswer(question, texts) {
+  const kind = bankKindOf(question);
+  if (!kind || !Array.isArray(texts)) return null;
+  if (kind === "single" || kind === "multiple") return choiceAnswer(question, kind, texts);
+  if (kind === "judge") {
+    const truth = judgeAnswer(question, texts);
+    return truth ? [truth] : null;
+  }
+  return blankAnswer(question, texts);
+}
+function bankAnswerToTexts(question, answer) {
+  const kind = bankKindOf(question);
+  if (!kind || !Array.isArray(answer) || answer.length === 0) return null;
+  if (kind === "single" || kind === "multiple") {
+    const options = optionSource(question);
+    const texts2 = [];
+    for (const id of answer) {
+      const option = options.find(
+        (item, index) => optionIdOf2(item, index) === String(id)
+      );
+      const text = String(option?.text ?? "");
+      if (!text.trim()) return null;
+      texts2.push(text);
+    }
+    return texts2;
+  }
+  if (kind === "judge") {
+    if (answer.length !== 1) return null;
+    const truth = truthOf(answer[0]);
+    if (!truth) return null;
+    const option = optionSource(question).find((item) => optionTruth(item) === truth);
+    const text = String(option?.text ?? "");
+    return text.trim() ? [text] : null;
+  }
+  const expected = blankCountOf(question);
+  const texts = answer.map((value) => String(value).trim());
+  return texts.length === expected && texts.every(Boolean) ? texts : null;
+}
+function answersEqual(question, left, right) {
+  const kind = bankKindOf(question);
+  const normalize = (values) => kind === "multiple" ? [...values].sort() : [...values];
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
+}
+async function callBank(method, params) {
+  if (!hostCall) throw new Error("question bank host is not configured");
+  return hostCall(method, params);
+}
+function messageOf(error) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && typeof error.message === "string") {
+    return String(error.message);
+  }
+  return String(error);
+}
+async function lookupEntries(session, course, questions) {
+  const hits = [];
+  for (const question of questions ?? []) {
+    const bankQuestion = toBankQuestion(question);
+    if (!bankQuestion) continue;
+    const questionId = String(question?.id ?? "");
+    try {
+      const result = await callBank("cw.question_bank.lookup", {
+        session,
+        course,
+        question: bankQuestion
+      });
+      const correct = result?.correct;
+      if (!Array.isArray(correct) || correct.length === 0) continue;
+      const texts = bankAnswerToTexts(question, correct);
+      if (!texts) {
+        hostLog("warn", `question bank answer for ${questionId} did not map to option text`);
+        continue;
+      }
+      hits.push({ questionId, answer: correct.map(String), texts });
+    } catch (error) {
+      hostLog("warn", `question bank lookup ${questionId} failed: ${messageOf(error)}`);
+    }
+  }
+  return hits;
+}
+async function lookupAnswers(session, course, questions) {
+  const entries = await lookupEntries(session, course, questions);
+  return entries.map(({ questionId, texts }) => ({
+    questionId,
+    texts,
+    confidence: 1,
+    source: "bank"
+  }));
+}
+async function lookupBankAnswers(session, course, questions) {
+  return lookupEntries(session, course, questions);
+}
+async function submitBankAnswer(method, session, course, question, answer, extra) {
+  const bankQuestion = toBankQuestion(question);
+  if (!bankQuestion) return;
+  try {
+    await callBank(method, {
+      session,
+      course,
+      question: bankQuestion,
+      answer,
+      ...extra
+    });
+  } catch (error) {
+    hostLog(
+      "warn",
+      `question bank ${method.split(".").pop()} ${String(question?.id ?? "")} failed: ${messageOf(error)}`
+    );
+  }
+}
+function confirmCorrect(session, course, question, answer, reference) {
+  return submitBankAnswer("cw.question_bank.confirm", session, course, question, answer, {
+    confirmation: { confirmed: true, source: "platform", reference: String(reference ?? "") }
+  });
+}
+function recordIncorrect(session, course, question, answer) {
+  return submitBankAnswer("cw.question_bank.record", session, course, question, answer, {
+    evidence: { result: "incorrect", source: "platform" }
+  });
+}
+
 // src/module.ts
 var MANIFEST = JSON.parse(
   readFileSync(new URL("./courseflow.module.json", import.meta.url), "utf8")
@@ -1899,12 +2209,13 @@ var log = (level, message) => process.stderr.write(`[unipus] ${level} ${message}
 `);
 var nextId = 1;
 var pending = /* @__PURE__ */ new Map();
-function hostCall(method, params) {
+function hostCall2(method, params) {
   const id = nextId++;
   const promise = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
   write({ jsonrpc: "2.0", id, method, params });
   return promise;
 }
+configureBank(hostCall2, log);
 function errorText(error) {
   if (error instanceof Error) return error.message;
   if (error && typeof error === "object" && typeof error.message === "string") {
@@ -1968,7 +2279,7 @@ async function followRedirects(session, startUrl, maxHops = 8, headers = {}) {
   let current = String(startUrl);
   let response;
   for (let hop = 0; hop < maxHops; hop += 1) {
-    response = await hostCall("cw.net.fetch", {
+    response = await hostCall2("cw.net.fetch", {
       session,
       method: "GET",
       url: current,
@@ -1987,7 +2298,7 @@ async function followRedirects(session, startUrl, maxHops = 8, headers = {}) {
 }
 async function validateServiceTicket(session, service, ticket) {
   const url = `${SSO_BASE}/sso/serviceTicket/validate?service=${encodeURIComponent(service)}&ticket=${encodeURIComponent(ticket)}`;
-  const response = await hostCall("cw.net.fetch", {
+  const response = await hostCall2("cw.net.fetch", {
     session,
     method: "GET",
     url,
@@ -2022,7 +2333,7 @@ async function validateServiceTicket(session, service, ticket) {
 async function browserReadJwt(session, url) {
   let page;
   try {
-    const opened = await hostCall("cw.browser.open", {
+    const opened = await hostCall2("cw.browser.open", {
       session,
       url,
       purpose: "portal-token"
@@ -2056,7 +2367,7 @@ async function browserReadJwt(session, url) {
       }
       return read();
     })()`;
-    const result = await hostCall("cw.browser.evaluate", {
+    const result = await hostCall2("cw.browser.evaluate", {
       session,
       page,
       expression,
@@ -2069,7 +2380,7 @@ async function browserReadJwt(session, url) {
       refreshToken: typeof result.rt === "string" && result.rt ? result.rt : void 0
     };
   } finally {
-    if (page) await hostCall("cw.browser.close", { session, page }).catch(() => {
+    if (page) await hostCall2("cw.browser.close", { session, page }).catch(() => {
     });
   }
 }
@@ -2130,7 +2441,7 @@ function authBegin(params) {
 async function liveLogin(session, username, password) {
   const service = buildCasService(TARGET_URL);
   const loginPage = `${SSO_BASE}/sso/login?service=${encodeURIComponent(service)}`;
-  await hostCall("cw.net.fetch", {
+  await hostCall2("cw.net.fetch", {
     session,
     method: "GET",
     url: loginPage,
@@ -2140,7 +2451,7 @@ async function liveLogin(session, username, password) {
       accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
   });
-  const loginResponse = await hostCall("cw.net.fetch", {
+  const loginResponse = await hostCall2("cw.net.fetch", {
     session,
     method: "POST",
     url: `${SSO_BASE}/sso/0.1/sso/cip/login`,
@@ -2232,7 +2543,7 @@ async function authSubmit(params) {
       display_name: identity.displayName,
       account_raw: identity.openId
     };
-    await hostCall("cw.state", {
+    await hostCall2("cw.state", {
       session: id,
       namespace: "auth",
       key: "session",
@@ -2272,7 +2583,7 @@ function authComplete(params) {
 }
 async function authVerify(params) {
   try {
-    const identity = await hostCall("cw.session.identity", { session: params.session });
+    const identity = await hostCall2("cw.session.identity", { session: params.session });
     return {
       display_name: identity?.display_name ?? "U\u6821\u56ED",
       account_raw: identity?.account_raw ?? "",
@@ -2280,7 +2591,7 @@ async function authVerify(params) {
     };
   } catch {
     try {
-      const stored = await hostCall("cw.state", {
+      const stored = await hostCall2("cw.state", {
         session: params.session,
         namespace: "auth",
         key: "session"
@@ -2297,7 +2608,7 @@ async function authVerify(params) {
   }
 }
 async function refreshPortalJwt(session, refreshToken) {
-  const response = await hostCall("cw.net.fetch", {
+  const response = await hostCall2("cw.net.fetch", {
     session,
     method: "POST",
     url: `${SSO_BASE}/sso/4.0/sso/refresh_jwt`,
@@ -2329,7 +2640,7 @@ async function refreshPortalJwt(session, refreshToken) {
 async function authKeepalive(params) {
   if (SOURCE === "fixture") return { ok: true, mode: SOURCE };
   try {
-    const state = await hostCall("cw.state", {
+    const state = await hostCall2("cw.state", {
       session: params.session,
       namespace: "auth",
       key: "session"
@@ -2341,7 +2652,7 @@ async function authKeepalive(params) {
       const refreshed = await refreshPortalJwt(params.session, value.refresh_token).catch(() => null);
       if (refreshed) {
         value = { ...value, ...refreshed, connected_at: value.connected_at };
-        await hostCall("cw.state", {
+        await hostCall2("cw.state", {
           session: params.session,
           namespace: "auth",
           key: "session",
@@ -2390,7 +2701,7 @@ function hostFetchFor(session) {
       rawBody instanceof Uint8Array ? rawBody : new Uint8Array(rawBody)
     ).toString("base64") : rawBody === void 0 || rawBody === null ? void 0 : typeof rawBody === "string" ? rawBody : String(rawBody);
     const stage = /\/api\/reader\/action\/finishNode|\/api\/reader\/answer\/submitScore|\/api\/reader\/answer\/judgeStart|\/api\/reader\/answer\/judgeResult/.test(url) ? "save_study" : "read";
-    const response = await hostCall("cw.net.fetch", {
+    const response = await hostCall2("cw.net.fetch", {
       session,
       method: String(init.method ?? "GET").toUpperCase(),
       url,
@@ -2413,7 +2724,7 @@ function baseHeaders3(token) {
   };
 }
 async function readAuth(session) {
-  const stored = await hostCall("cw.state", { session, namespace: "auth", key: "session" });
+  const stored = await hostCall2("cw.state", { session, namespace: "auth", key: "session" });
   const value = stored?.value;
   if (!value?.jwt || !value?.open_id) {
     throw { code: "platform_login_expired", message: "\u8BF7\u5148\u8FDE\u63A5 U\u6821\u56ED\uFF0C\u5F53\u524D\u767B\u5F55\u6001\u5DF2\u5931\u6548" };
@@ -2469,7 +2780,7 @@ function mapBookshelf(groups) {
   return courses;
 }
 async function fetchBookshelf(session, jwt) {
-  const response = await hostCall("cw.net.fetch", {
+  const response = await hostCall2("cw.net.fetch", {
     session,
     method: "GET",
     url: `${PORTAL_BASE}/api/cmgt/course/my/bookshelf`,
@@ -2508,7 +2819,7 @@ async function loadCourses(session) {
     groups = await fetchBookshelf(session, auth.jwt);
   } catch (error) {
     if (error?.code === "platform_login_expired") throw error;
-    const stored = await hostCall("cw.state", {
+    const stored = await hostCall2("cw.state", {
       session,
       namespace: "unipus-v1",
       key: "courses"
@@ -2523,7 +2834,7 @@ async function loadCourses(session) {
   }
   const courses = mapBookshelf(groups);
   courseListCache.set(session, { at: Date.now(), value: courses });
-  await hostCall("cw.state", {
+  await hostCall2("cw.state", {
     session,
     namespace: "unipus-v1",
     key: "courses",
@@ -2537,7 +2848,7 @@ function readerTokenExpired(value) {
   return expiresAt > 0 && expiresAt * 1e3 < Date.now() + 6e4;
 }
 async function exchangeReaderTokenHttp(session, auth, courseId) {
-  const response = await hostCall("cw.net.fetch", {
+  const response = await hostCall2("cw.net.fetch", {
     session,
     method: "POST",
     url: `${CONTENT_BASE}/course/api/v3/ipublish/token`,
@@ -2570,7 +2881,7 @@ async function exchangeReaderTokenBrowser(session, auth, courseId) {
   const annotator = signAnnotatorToken2(auth.open_id);
   let page;
   try {
-    const opened = await hostCall("cw.browser.open", {
+    const opened = await hostCall2("cw.browser.open", {
       session,
       url: TARGET_URL,
       purpose: "reader-token"
@@ -2602,7 +2913,7 @@ async function exchangeReaderTokenBrowser(session, auth, courseId) {
     })()`;
     let result = null;
     for (let attempt = 0; attempt < 10; attempt += 1) {
-      result = await hostCall("cw.browser.evaluate", {
+      result = await hostCall2("cw.browser.evaluate", {
         session,
         page,
         expression,
@@ -2621,13 +2932,13 @@ async function exchangeReaderTokenBrowser(session, auth, courseId) {
       expires_at: decodeJwtExpiry(String(result.token)) ?? null
     };
   } finally {
-    if (page) await hostCall("cw.browser.close", { session, page }).catch(() => {
+    if (page) await hostCall2("cw.browser.close", { session, page }).catch(() => {
     });
   }
 }
 async function readerTokenFor(session, auth, courseId) {
   const key = `reader/${courseId}`;
-  const stored = await hostCall("cw.state", { session, namespace: "auth", key });
+  const stored = await hostCall2("cw.state", { session, namespace: "auth", key });
   const value = stored?.value;
   if (value?.token && value.open_id === auth.open_id && !readerTokenExpired(value)) {
     return String(value.token);
@@ -2639,7 +2950,7 @@ async function readerTokenFor(session, auth, courseId) {
     log("warn", `reader token http failed for ${courseId}: ${errorText(error)}`);
     tokenValue = await exchangeReaderTokenBrowser(session, auth, courseId);
   }
-  await hostCall("cw.state", {
+  await hostCall2("cw.state", {
     session,
     namespace: "auth",
     key,
@@ -2772,7 +3083,7 @@ async function getChapterStructure(fetcher, token, cfg, chapterId) {
 }
 async function readCachedAnswers(session, key) {
   try {
-    const stored = await hostCall("cw.state", { session, namespace: "answers", key });
+    const stored = await hostCall2("cw.state", { session, namespace: "answers", key });
     const value = stored?.value;
     return Array.isArray(value) ? value : null;
   } catch {
@@ -2890,9 +3201,88 @@ function applyPlatformAnswers(submission, state) {
   });
   return changed ? { ...submission, userAnswers } : null;
 }
+var BANK_QUESTION_TYPES = /* @__PURE__ */ new Set([
+  "single_choice",
+  "multiple_choice",
+  "true_false",
+  "fill_blanks",
+  "fill_blanks_choice",
+  "single",
+  "multiple",
+  "judge"
+]);
+function bankTypeOf(question) {
+  const raw = String(question?.rawType ?? question?.type ?? "").trim().toLowerCase();
+  return raw.endsWith("_group") ? raw.slice(0, -"_group".length) : raw;
+}
+function platformKeyValues(state, questions) {
+  const byChild = /* @__PURE__ */ new Map();
+  for (const item of state.data?.correctAnswers ?? []) {
+    if (!item?.childId) continue;
+    const value = (item.answers ?? []).find(
+      (answer) => typeof answer?.answerValue === "string" && answer.answerValue.length > 0
+    )?.answerValue;
+    if (value) byChild.set(String(item.childId), String(value));
+  }
+  const out = /* @__PURE__ */ new Map();
+  for (const question of questions ?? []) {
+    const childIds = Array.isArray(question.childIds) && question.childIds.length > 0 ? question.childIds.map((id) => String(id)) : [String(question.id)];
+    const values = childIds.map((id) => byChild.get(id)).filter((value) => Boolean(value));
+    if (values.length > 0) out.set(String(question.id), values);
+  }
+  return out;
+}
+async function syncQuestionBank(session, cfg, questions, answers, state, reference) {
+  try {
+    const course = courseScope(cfg);
+    const submitted = /* @__PURE__ */ new Map();
+    for (const answer of answers ?? []) {
+      if (!answer || !Array.isArray(answer.texts)) continue;
+      submitted.set(
+        String(answer.questionId),
+        answer.texts.map((value) => String(value))
+      );
+    }
+    const keyed = state.hasKey ? platformKeyValues(state, questions) : /* @__PURE__ */ new Map();
+    for (const question of questions ?? []) {
+      if (!BANK_QUESTION_TYPES.has(bankTypeOf(question))) continue;
+      if (!toBankQuestion(question)) continue;
+      const id = String(question.id);
+      const texts = submitted.get(id);
+      const submittedAnswer = texts && texts.length > 0 ? textsToBankAnswer(question, texts) : null;
+      if (state.hasKey) {
+        const values = keyed.get(id);
+        const platformAnswer = values ? platformKeyToBankAnswer(question, values) : null;
+        if (!platformAnswer) continue;
+        await confirmCorrect(
+          session,
+          course,
+          question,
+          platformAnswer,
+          `${reference}:${id}`
+        );
+        if (submittedAnswer && !answersEqual(question, submittedAnswer, platformAnswer)) {
+          await recordIncorrect(session, course, question, submittedAnswer);
+        }
+        continue;
+      }
+      if (state.score === 100 && submittedAnswer) {
+        await confirmCorrect(
+          session,
+          course,
+          question,
+          submittedAnswer,
+          `${reference}:${id}`
+        );
+      }
+    }
+  } catch (error) {
+    log("warn", `question bank sync ${reference} failed: ${errorText(error)}`);
+  }
+}
 async function readActivityState(session, key) {
   try {
-    const stored = await hostCall("cw.state", { session, namespace: "activity", key });
+    const stored = await hostCall2("cw.state", { session, namespace: "activity", key });
     return stored?.value ?? null;
   } catch {
     return null;
@@ -2900,7 +3290,7 @@ async function readActivityState(session, key) {
 }
 async function saveActivityState(session, key, value) {
   try {
-    await hostCall("cw.state", { session, namespace: "activity", key, value });
+    await hostCall2("cw.state", { session, namespace: "activity", key, value });
   } catch {
   }
 }
@@ -2926,7 +3316,7 @@ async function readSubmissionLedger(session, bookId) {
     blocked: {}
   };
   try {
-    const stored = await hostCall("cw.state", {
+    const stored = await hostCall2("cw.state", {
       session,
       namespace: "submissions",
       key: bookId
@@ -2946,7 +3336,7 @@ async function readSubmissionLedger(session, bookId) {
 async function saveSubmissionLedger(session, bookId, value) {
   submissionLedgerCache.set(`${session}:${bookId}`, { at: Date.now(), value });
   try {
-    await hostCall("cw.state", {
+    await hostCall2("cw.state", {
       session,
       namespace: "submissions",
       key: bookId,
@@ -3018,12 +3408,25 @@ function chunkArray(items, size) {
   }
   return chunks;
 }
-async function solveQuestions(session, activity) {
+async function solveQuestions(session, activity, course, cached = null) {
   const questions = (activity.questions ?? []).filter(
     (question) => !isOralQuestion(question)
   );
+  const cachedById = /* @__PURE__ */ new Map();
+  for (const answer of cached ?? []) {
+    if (answer && typeof answer.questionId === "string") {
+      cachedById.set(answer.questionId, answer);
+    }
+  }
+  const bankHits = await lookupAnswers(session, course, questions);
+  const bankById = new Map(bankHits.map((hit) => [hit.questionId, hit]));
+  const missing = questions.filter((question) => {
+    if (bankById.has(String(question.id))) return false;
+    const answer = cachedById.get(String(question.id));
+    return !(Array.isArray(answer?.texts) && answer.texts.length > 0);
+  });
   const byId = /* @__PURE__ */ new Map();
-  const batches = chunkArray(questions, 8);
+  const batches = chunkArray(missing, 8);
   for (const [batchIndex, batch] of batches.entries()) {
     const payload = batch.map((question) => ({
       id: question.id,
@@ -3043,7 +3446,7 @@ async function solveQuestions(session, activity) {
     ].join("\n");
     let parsed = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const response = await hostCall("cw.ai.generate", {
+      const response = await hostCall2("cw.ai.generate", {
         session,
         prompt: attempt === 0 ? prompt : `${prompt}
 \u4E0A\u6B21\u8F93\u51FA\u4E0D\u662F\u5408\u6CD5 JSON \u6570\u7EC4\uFF1B\u8FD9\u6B21\u53EA\u8F93\u51FA JSON\uFF0C\u4E0D\u8981 Markdown\u3002`
@@ -3072,12 +3475,19 @@ async function solveQuestions(session, activity) {
       if (id) byId.set(id, texts);
     }
   }
-  return (activity.questions ?? []).map((question) => ({
-    questionId: question.id,
-    texts: byId.get(question.id) ?? [],
-    confidence: 0.8,
-    source: "llm"
-  }));
+  return (activity.questions ?? []).map((question) => {
+    const id = String(question.id);
+    const bank = bankById.get(id);
+    if (bank) return bank;
+    const cachedAnswer = cachedById.get(id);
+    if (cachedAnswer) return cachedAnswer;
+    return {
+      questionId: question.id,
+      texts: byId.get(question.id) ?? [],
+      confidence: 0.8,
+      source: "llm"
+    };
+  });
 }
 var SPEECH_WS_URL = "wss://speech.unipus.cn/speech/proxy/wss";
 var BAIDU_TTS_URL = "https://fanyi.baidu.com/gettts";
@@ -3087,9 +3497,9 @@ function isOralQuestion(question) {
   return type === "oral_personal_state" || type.startsWith("oral_personal_state_");
 }
 function splitSpeechText(text, max = 90) {
-  const clean = text.replace(/\s+/g, " ").trim();
-  if (!clean) return [];
-  const pieces = clean.split(/(?<=[.!?;,])\s+/);
+  const clean2 = text.replace(/\s+/g, " ").trim();
+  if (!clean2) return [];
+  const pieces = clean2.split(/(?<=[.!?;,])\s+/);
   const chunks = [];
   let current = "";
   const push = () => {
@@ -3118,7 +3528,7 @@ async function synthesizeSpeech(session, text) {
   const parts = [];
   for (const chunk of chunks) {
     const url = `${BAIDU_TTS_URL}?lan=en&spd=5&source=web&text=${encodeURIComponent(chunk)}`;
-    const response = await hostCall("cw.net.fetch", {
+    const response = await hostCall2("cw.net.fetch", {
       session,
       method: "GET",
       url,
@@ -3227,13 +3637,13 @@ async function oralSpokenAnswer(session, prompt) {
     "",
     prompt
   ].join("\n");
-  const response = await hostCall("cw.ai.generate", { session, prompt: request });
+  const response = await hostCall2("cw.ai.generate", { session, prompt: request });
   const text = String(response?.text ?? "").replace(/\s+/g, " ").trim();
   if (!text) throw new Error("\u6A21\u578B\u6CA1\u6709\u751F\u6210\u53E3\u8BED\u7B54\u6848");
   return text;
 }
 async function openOfficialPage(session, url) {
-  const opened = await hostCall("cw.browser.open", {
+  const opened = await hostCall2("cw.browser.open", {
     session,
     url,
     stage: "read"
@@ -3244,7 +3654,7 @@ async function openOfficialPage(session, url) {
 }
 async function evaluateOnPage(session, page, expression) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const value = await hostCall("cw.browser.evaluate", {
+    const value = await hostCall2("cw.browser.evaluate", {
       session,
       page,
       stage: "read",
@@ -3445,7 +3855,7 @@ async function runMatchingFallback(session, meta, question, answers) {
     }
     for (const edge of coords.edges ?? []) {
       if (edge.skip || edge.error || !edge.from || !edge.to) continue;
-      await hostCall("cw.browser.mouse", {
+      await hostCall2("cw.browser.mouse", {
         session,
         page,
         stage: "save_study",
@@ -3460,7 +3870,7 @@ async function runMatchingFallback(session, meta, question, answers) {
     log("warn", `matching fallback failed: ${errorText(error)}`);
     return false;
   } finally {
-    await hostCall("cw.browser.close", { session, page }).catch(() => {
+    await hostCall2("cw.browser.close", { session, page }).catch(() => {
     });
   }
 }
@@ -3573,7 +3983,7 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
           try {
             await runOralQuestion(session, cfg, auth, fetcher, meta, question, page);
           } finally {
-            await hostCall("cw.browser.close", { session, page, stage: "read" }).catch(() => {
+            await hostCall2("cw.browser.close", { session, page, stage: "read" }).catch(() => {
             });
           }
         } else {
@@ -3601,16 +4011,19 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
         };
       }
       const pendingQuestions = questionsOfGroup(groupId);
-      let answers = await readCachedAnswers(session, rawId);
-      if (!answers) {
-        answers = await solveQuestions(session, { ...activity, questions: pendingQuestions });
-        await hostCall("cw.state", {
-          session,
-          namespace: "answers",
-          key: rawId,
-          value: answers
-        });
-      }
+      const cached = await readCachedAnswers(session, rawId);
+      const answers = await solveQuestions(
+        session,
+        { ...activity, questions: pendingQuestions },
+        courseScope(cfg),
+        cached
+      );
+      await hostCall2("cw.state", {
+        session,
+        namespace: "answers",
+        key: rawId,
+        value: answers
+      });
       const { submissions, warnings } = buildChapterSubmissions(pendingQuestions, answers);
       if (warnings.length > 0) log("warn", `chapter warnings: ${warnings.join("; ")}`);
       if (submissions.length === 0) {
@@ -3775,6 +4188,16 @@ async function studyQuestionStep(params, session, cfg, auth, fetcher, rawId) {
             log("info", `matching fallback ${groupId} score=${post.score ?? "?"}`);
           }
         }
+      }
+      if (post) {
+        await syncQuestionBank(
+          session,
+          cfg,
+          questions,
+          answers,
+          post,
+          `chapter:${chapterId}:${groupId}`
+        );
       }
       if (!post?.complete) {
         const reason = post?.objective ? `\u9898\u7EC4 ${groupId} \u5BA2\u89C2\u9898\u672A\u8FBE\u5230 100 \u5206\uFF08\u5F53\u524D ${post?.score ?? "\u65E0\u5206\u6570"}\uFF09` : `\u9898\u7EC4 ${groupId} \u5C1A\u672A\u5B8C\u6210\uFF08\u5E73\u53F0\u672A\u8FD4\u56DE\u6210\u7EE9\uFF09`;
@@ -4038,7 +4461,16 @@ ${body}`;
   }
   return body;
 }
-function toExamAttempt(paperData) {
+function examQuestionCacheable(question) {
+  const raw = String(question?.rawType ?? question?.type ?? "").trim().toLowerCase();
+  if (raw === "matching" || raw === "text_match" || raw === "sequence" || raw === "writing" || raw === "translation" || raw === "short_answer" || raw === "oral_personal_state" || raw === "discussion" || raw === "multi_media_upload") {
+    return false;
+  }
+  return ["single", "multiple", "judge", "blank"].includes(
+    examQuestionKind(question)
+  );
+}
+function toExamAttempt(paperData, bankAnswers) {
   return {
     id: paperData.instanceId,
     paper_id: paperData.paperId,
@@ -4052,7 +4484,7 @@ function toExamAttempt(paperData) {
         id: String(option.optionId ?? option.value ?? option.index),
         text: option.text
       })),
-      answer: [],
+      answer: bankAnswers?.get(String(question.id)) ?? [],
       blanks: examQuestionBlanks(question)
     }))
   };
@@ -4281,24 +4713,27 @@ async function examOpen(params) {
     "info",
     `exam open ${paperData.paperId} instance=${paperData.instanceId} ` + (paperData.questions ?? []).map((question) => `${question.rawType}:${question.type}:${question.blankCount}:${question.options?.length ?? 0}`).join(",")
   );
-  await hostCall("cw.state", {
+  const cacheable = (paperData.questions ?? []).filter(examQuestionCacheable);
+  const bankHits = await lookupBankAnswers(session, courseScope(cfg), cacheable);
+  const bankAnswers = new Map(bankHits.map((hit) => [hit.questionId, hit.answer]));
+  await hostCall2("cw.state", {
     session,
     namespace: "exam",
     key: `paper/${paperData.instanceId}`,
     value: { meta, paperData, answers: {}, phase: "opened" }
   });
-  await hostCall("cw.state", {
+  await hostCall2("cw.state", {
     session,
     namespace: "exam",
     key: `latest/${paperData.paperId}`,
     value: paperData.instanceId
   });
-  return { ready: true, attempt: toExamAttempt(paperData) };
+  return { ready: true, attempt: toExamAttempt(paperData, bankAnswers) };
 }
 async function examWrite(params) {
   const session = String(params.session ?? "");
   const attemptId = String(params.attempt_id ?? "");
-  const stored = await hostCall("cw.state", {
+  const stored = await hostCall2("cw.state", {
     session,
     namespace: "exam",
     key: `paper/${attemptId}`
@@ -4335,7 +4770,7 @@ async function examWrite(params) {
   const phase = params.phase === "submit" ? "submit" : "draft";
   if (state.meta.paperType === 2) {
     if (phase !== "submit") {
-      await hostCall("cw.state", {
+      await hostCall2("cw.state", {
         session,
         namespace: "exam",
         key: `paper/${attemptId}`,
@@ -4389,7 +4824,7 @@ async function examWrite(params) {
     if (score.code !== 0 && score.code !== 200) {
       throw new Error(`submitUserChallengeScore failed: ${score.message ?? `code ${score.code}`}`);
     }
-    await hostCall("cw.state", {
+    await hostCall2("cw.state", {
       session,
       namespace: "exam",
       key: `paper/${attemptId}`,
@@ -4399,7 +4834,7 @@ async function examWrite(params) {
   }
   if (phase === "submit") {
     await submitUnitTest(fetcher, auth, state.paperData, answerList, state.meta);
-    await hostCall("cw.state", {
+    await hostCall2("cw.state", {
       session,
       namespace: "exam",
       key: `paper/${attemptId}`,
@@ -4408,7 +4843,7 @@ async function examWrite(params) {
     return { done: true, cursor: null, draft_supported: true };
   }
   await saveUnitTestAnswers(fetcher, auth, state.paperData, answerList);
-  await hostCall("cw.state", {
+  await hostCall2("cw.state", {
     session,
     namespace: "exam",
     key: `paper/${attemptId}`,
@@ -4419,7 +4854,7 @@ async function examWrite(params) {
 async function examReadback(params) {
   const session = String(params.session ?? "");
   const attemptId = String(params.attempt_id ?? "");
-  const stored = await hostCall("cw.state", {
+  const stored = await hostCall2("cw.state", {
     session,
     namespace: "exam",
     key: `paper/${attemptId}`
@@ -4457,7 +4892,7 @@ async function examReview(params) {
   const session = String(params.session ?? "");
   let attemptId = String(params.attempt_id ?? "");
   if (!attemptId && params.paper_id) {
-    const latest = await hostCall("cw.state", {
+    const latest = await hostCall2("cw.state", {
       session,
       namespace: "exam",
       key: `latest/${String(params.paper_id)}`
@@ -4465,7 +4900,7 @@ async function examReview(params) {
     attemptId = String(latest?.value ?? "");
   }
   if (!attemptId) return { ready: false };
-  const stored = await hostCall("cw.state", {
+  const stored = await hostCall2("cw.state", {
     session,
     namespace: "exam",
     key: `paper/${attemptId}`
