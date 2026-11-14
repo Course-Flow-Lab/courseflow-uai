@@ -57,6 +57,18 @@ import {
   findUploadSpec,
   uploadAnswerFile,
 } from './vendor/upload.js';
+import {
+  answersEqual,
+  configureBank,
+  confirmCorrect,
+  courseScope,
+  lookupAnswers,
+  lookupBankAnswers,
+  platformKeyToBankAnswer,
+  recordIncorrect,
+  textsToBankAnswer,
+  toBankQuestion,
+} from './bank.js';
 
 const MANIFEST = JSON.parse(
   readFileSync(new URL('./courseflow.module.json', import.meta.url), 'utf8'),
@@ -127,6 +139,8 @@ function hostCall(method, params) {
 function hostLog(level, message) {
   write({ jsonrpc: '2.0', method: 'cw.log', params: { level, message } });
 }
+
+configureBank(hostCall, log);
 
 function errorText(error) {
   if (error instanceof Error) return error.message;
@@ -1378,6 +1392,127 @@ function applyPlatformAnswers(submission: any, state: GroupState): any | null {
   return changed ? { ...submission, userAnswers } : null;
 }
 
+const BANK_QUESTION_TYPES = new Set([
+  'single_choice',
+  'multiple_choice',
+  'true_false',
+  'fill_blanks',
+  'fill_blanks_choice',
+  'single',
+  'multiple',
+  'judge',
+]);
+
+function bankTypeOf(question: any): string {
+  const raw = String(question?.rawType ?? question?.type ?? '')
+    .trim()
+    .toLowerCase();
+  return raw.endsWith('_group') ? raw.slice(0, -'_group'.length) : raw;
+}
+
+/** Platform `correctAnswers` grouped by question id, in child order. */
+function platformKeyValues(
+  state: GroupState,
+  questions: any[],
+): Map<string, string[]> {
+  const byChild = new Map<string, string>();
+  for (const item of state.data?.correctAnswers ?? []) {
+    if (!item?.childId) continue;
+    const value = (item.answers ?? []).find(
+      (answer: any) =>
+        typeof answer?.answerValue === 'string' && answer.answerValue.length > 0,
+    )?.answerValue;
+    if (value) byChild.set(String(item.childId), String(value));
+  }
+  const out = new Map<string, string[]>();
+  for (const question of questions ?? []) {
+    const childIds =
+      Array.isArray(question.childIds) && question.childIds.length > 0
+        ? question.childIds.map((id: any) => String(id))
+        : [String(question.id)];
+    const values = childIds
+      .map((id: string) => byChild.get(id))
+      .filter((value): value is string => Boolean(value));
+    if (values.length > 0) out.set(String(question.id), values);
+  }
+  return out;
+}
+
+/**
+ * Persist platform-graded answers after submitScore/judgeStart readback.
+ *
+ * The platform key wins: it is confirmed as-is, and any submitted answer that
+ * differs is recorded as incorrect so the mistake is never replayed. Objective
+ * groups that scored 100 without exposing a key are confirmed from the
+ * submitted answer instead. Every failure is a warning; a step must not fail
+ * because the bank is unavailable.
+ */
+async function syncQuestionBank(
+  session: string,
+  cfg: any,
+  questions: any[],
+  answers: any[],
+  state: GroupState,
+  reference: string,
+): Promise<void> {
+  try {
+    const course = courseScope(cfg);
+    const submitted = new Map<string, string[]>();
+    for (const answer of answers ?? []) {
+      if (!answer || !Array.isArray(answer.texts)) continue;
+      submitted.set(
+        String(answer.questionId),
+        answer.texts.map((value: any) => String(value)),
+      );
+    }
+    const keyed = state.hasKey
+      ? platformKeyValues(state, questions)
+      : new Map<string, string[]>();
+    for (const question of questions ?? []) {
+      if (!BANK_QUESTION_TYPES.has(bankTypeOf(question))) continue;
+      if (!toBankQuestion(question)) continue;
+      const id = String(question.id);
+      const texts = submitted.get(id);
+      const submittedAnswer =
+        texts && texts.length > 0 ? textsToBankAnswer(question, texts) : null;
+
+      if (state.hasKey) {
+        const values = keyed.get(id);
+        const platformAnswer = values
+          ? platformKeyToBankAnswer(question, values)
+          : null;
+        if (!platformAnswer) continue;
+        await confirmCorrect(
+          session,
+          course,
+          question,
+          platformAnswer,
+          `${reference}:${id}`,
+        );
+        if (
+          submittedAnswer &&
+          !answersEqual(question, submittedAnswer, platformAnswer)
+        ) {
+          await recordIncorrect(session, course, question, submittedAnswer);
+        }
+        continue;
+      }
+
+      if (state.score === 100 && submittedAnswer) {
+        await confirmCorrect(
+          session,
+          course,
+          question,
+          submittedAnswer,
+          `${reference}:${id}`,
+        );
+      }
+    }
+  } catch (error) {
+    log('warn', `question bank sync ${reference} failed: ${errorText(error)}`);
+  }
+}
+
 async function readActivityState(session: string, key: string): Promise<any | null> {
   try {
     const stored = await hostCall('cw.state', { session, namespace: 'activity', key });
@@ -1558,12 +1693,30 @@ function chunkArray<T>(items: T[], size: number): T[][] {
   return chunks;
 }
 
-async function solveQuestions(session: string, activity: any): Promise<any[]> {
+async function solveQuestions(
+  session: string,
+  activity: any,
+  course: string,
+  cached: any[] | null = null,
+): Promise<any[]> {
   const questions = (activity.questions ?? []).filter(
     (question: any) => !isOralQuestion(question),
   );
+  const cachedById = new Map<string, any>();
+  for (const answer of cached ?? []) {
+    if (answer && typeof answer.questionId === 'string') {
+      cachedById.set(answer.questionId, answer);
+    }
+  }
+  const bankHits = await lookupAnswers(session, course, questions);
+  const bankById = new Map(bankHits.map((hit) => [hit.questionId, hit]));
+  const missing = questions.filter((question: any) => {
+    if (bankById.has(String(question.id))) return false;
+    const answer = cachedById.get(String(question.id));
+    return !(Array.isArray(answer?.texts) && answer.texts.length > 0);
+  });
   const byId = new Map<string, string[]>();
-  const batches = chunkArray(questions, 8);
+  const batches = chunkArray(missing, 8);
   for (const [batchIndex, batch] of batches.entries()) {
     const payload = batch.map((question: any) => ({
       id: question.id,
@@ -1617,12 +1770,19 @@ async function solveQuestions(session: string, activity: any): Promise<any[]> {
       if (id) byId.set(id, texts);
     }
   }
-  return (activity.questions ?? []).map((question: any) => ({
-    questionId: question.id,
-    texts: byId.get(question.id) ?? [],
-    confidence: 0.8,
-    source: 'llm',
-  }));
+  return (activity.questions ?? []).map((question: any) => {
+    const id = String(question.id);
+    const bank = bankById.get(id);
+    if (bank) return bank;
+    const cachedAnswer = cachedById.get(id);
+    if (cachedAnswer) return cachedAnswer;
+    return {
+      questionId: question.id,
+      texts: byId.get(question.id) ?? [],
+      confidence: 0.8,
+      source: 'llm',
+    };
+  });
 }
 
 const SPEECH_WS_URL = 'wss://speech.unipus.cn/speech/proxy/wss';
@@ -2226,16 +2386,19 @@ async function studyQuestionStep(
         };
       }
       const pendingQuestions = questionsOfGroup(groupId);
-      let answers = await readCachedAnswers(session, rawId);
-      if (!answers) {
-        answers = await solveQuestions(session, { ...activity, questions: pendingQuestions });
-        await hostCall('cw.state', {
-          session,
-          namespace: 'answers',
-          key: rawId,
-          value: answers,
-        });
-      }
+      const cached = await readCachedAnswers(session, rawId);
+      const answers = await solveQuestions(
+        session,
+        { ...activity, questions: pendingQuestions },
+        courseScope(cfg),
+        cached,
+      );
+      await hostCall('cw.state', {
+        session,
+        namespace: 'answers',
+        key: rawId,
+        value: answers,
+      });
       const { submissions, warnings } = buildChapterSubmissions(pendingQuestions, answers);
       if (warnings.length > 0) log('warn', `chapter warnings: ${warnings.join('; ')}`);
       if (submissions.length === 0) {
@@ -2411,6 +2574,16 @@ async function studyQuestionStep(
             log('info', `matching fallback ${groupId} score=${post.score ?? '?'}`);
           }
         }
+      }
+      if (post) {
+        await syncQuestionBank(
+          session,
+          cfg,
+          questions,
+          answers,
+          post,
+          `chapter:${chapterId}:${groupId}`,
+        );
       }
       if (!post?.complete) {
         const reason = post?.objective
@@ -2706,7 +2879,34 @@ function examQuestionText(question: any): string {
   return body;
 }
 
-function toExamAttempt(paperData: any) {
+/**
+ * Only objective paper questions may use the bank. Matching is encoded as
+ * `multiple`/`blank` by `examQuestionKind`, and subjective types map to `blank`
+ * too, so both must be rejected before the kind is consulted.
+ */
+function examQuestionCacheable(question: any): boolean {
+  const raw = String(question?.rawType ?? question?.type ?? '')
+    .trim()
+    .toLowerCase();
+  if (
+    raw === 'matching' ||
+    raw === 'text_match' ||
+    raw === 'sequence' ||
+    raw === 'writing' ||
+    raw === 'translation' ||
+    raw === 'short_answer' ||
+    raw === 'oral_personal_state' ||
+    raw === 'discussion' ||
+    raw === 'multi_media_upload'
+  ) {
+    return false;
+  }
+  return ['single', 'multiple', 'judge', 'blank'].includes(
+    examQuestionKind(question),
+  );
+}
+
+function toExamAttempt(paperData: any, bankAnswers?: Map<string, string[]>) {
   return {
     id: paperData.instanceId,
     paper_id: paperData.paperId,
@@ -2720,7 +2920,7 @@ function toExamAttempt(paperData: any) {
         id: String(option.optionId ?? option.value ?? option.index),
         text: option.text,
       })),
-      answer: [],
+      answer: bankAnswers?.get(String(question.id)) ?? [],
       blanks: examQuestionBlanks(question),
     })),
   };
@@ -2985,6 +3185,10 @@ async function examOpen(params: any) {
         .join(','),
   );
 
+  const cacheable = (paperData.questions ?? []).filter(examQuestionCacheable);
+  const bankHits = await lookupBankAnswers(session, courseScope(cfg), cacheable);
+  const bankAnswers = new Map(bankHits.map((hit) => [hit.questionId, hit.answer]));
+
   await hostCall('cw.state', {
     session,
     namespace: 'exam',
@@ -2997,7 +3201,7 @@ async function examOpen(params: any) {
     key: `latest/${paperData.paperId}`,
     value: paperData.instanceId,
   });
-  return { ready: true, attempt: toExamAttempt(paperData) };
+  return { ready: true, attempt: toExamAttempt(paperData, bankAnswers) };
 }
 
 async function examWrite(params: any) {
