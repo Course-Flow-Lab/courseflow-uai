@@ -17,11 +17,12 @@ Courseflow 的 U校园ai版（Unipus）平台模块，提供课程目录、学�
 - 挑战卷和 Unit Test：创建实例、草稿、交卷、分数回读
 - 客观题答案回填：低于 100 分时用平台答案重交
 - 提交护栏：答案去重、请求限速、408/429/5xx 重试
+- 复用宿主题库中的已确认答案，并将平台判定结果回写题库
 
 ## 环境
 
 - Node.js 24 或更高
-- Courseflow Framework `>=0.1.1 <0.2.0`
+- Courseflow Framework `>=0.1.6 <0.2.0`
 - Chrome / Chromium，用于 live 登录、口语和连线题兜底
 
 ## 安装
